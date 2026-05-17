@@ -43,9 +43,73 @@ The runtime loop is single-threaded by design -- on a 4GB Nano, async
 producer/consumer queues tend to cause OOM more often than they help.
 If decode-latency hides inference time, add an explicit thread later.
 
+## Dev environment & deployment
+
+You'll typically be editing on the **Windows dev box** (`D:\Projects\NanoTracker\...`)
+and SSHing to the **Nano** to test.  The Nano is a separate machine -- none of the
+runtime (TRT, pycuda, aarch64 OpenCV, GStreamer NVDEC) works on Windows, so do
+not try to `python nano_tracker.py` on the dev box.
+
+  - **Nano host:** `nano` (resolved via mDNS / hosts file -- works regardless
+    of DHCP).  Reolink camera is at `192.168.1.72`.  Do NOT hardcode the
+    Nano's LAN IP anywhere: it's DHCP-assigned and has moved at least once
+    (was `.181`, now `.119`); the hostname is the stable handle.  To get
+    the current LAN IPv4 when you need one (e.g. for the dashboard URL):
+    `ssh -i ~/.ssh/nanotracker_claude claude@nano "hostname -I | tr ' ' '\n' | grep '^192.168'"`.
+  - **SSH:** `ssh -i ~/.ssh/nanotracker_claude claude@nano`.  The working
+    account is `claude`; the private key is named exactly `nanotracker_claude`
+    (no extension) in the dev box's `~/.ssh/`.  No `Host nano` alias exists in
+    `~/.ssh/config` by default -- pass `-i` explicitly or add one.  When the
+    Nano's IP changes you may get `Host key verification failed` if you SSH
+    by the new IP (the hostname entry in `known_hosts` is fine; new IPs are
+    new entries) -- use `-o StrictHostKeyChecking=accept-new` for the first
+    connection by IP.
+  - **Working dir on the Nano:** `/home/claude/NanoTracker/`.  This is **NOT a
+    git repository** -- files were copied
+    in directly.  Deploy changes via `scp` of individual files; do not attempt
+    `git pull` on the Nano.  (Future cleanup: `git init` + add origin so this
+    becomes a normal pull workflow.)
+  - **Camera password lives in `camera_config.json`** on the Nano (mode 600).
+    `nano_tracker.py` reads it directly -- no `REOLINK_PASSWORD` env var needed
+    when launching from the Nano.  Never copy `camera_config.json` from dev to
+    Nano (it's gitignored on dev and only the `.example` template is checked
+    in -- the dev copy has no real password).
+  - **Dashboard:** `http://<nano-lan-ip>:8080/` while a session is running
+    (see above for getting the current IP).  The tracker prints a dashboard
+    URL on startup but it's often `127.0.1.1` from `gethostbyname` on the
+    Nano -- that's loopback, useless from outside; use the LAN IP.  Index
+    page auto-redirects to the latest summary HTML.
+
+### Sync code changes from dev box to Nano
+
+```bash
+# from the dev box, in your worktree
+scp -i ~/.ssh/nanotracker_claude nano_tracker.py claude@nano:/home/claude/NanoTracker/
+ssh -i ~/.ssh/nanotracker_claude claude@nano "wc -c ~/NanoTracker/nano_tracker.py"
+```
+
+Gitignored on the dev side and Nano-only: `camera_config.json`, `*.engine`,
+`*.onnx`, `output/`.  TRT engines are not portable across GPU architectures --
+always build on the Nano.
+
+### Launch / stop over SSH
+
+```bash
+# Launch nohup'd.  `< /dev/null` is essential -- without it ssh keeps the
+# channel open even though python is daemonised, and your terminal hangs.
+ssh claude@nano "cd ~/NanoTracker && nohup python3 -u nano_tracker.py \
+    --config camera_config.json > nano_live.log 2>&1 < /dev/null & echo PID=\$!"
+
+# That PID is the *bash wrapper*, not python.  To find the actual python
+# process (needed for a graceful SIGTERM that flushes final JSON + HTML):
+ssh claude@nano "ps -ef | awk '\$8 ~ /python3/ && /nano_tracker/'"
+ssh claude@nano "kill <python_pid>"
+```
+
 ## Common tasks
 
-  - **Run on Nano:** `python3 nano_tracker.py --config camera_config.json --duration 60`
+  - **Run on Nano (local shell):** `python3 nano_tracker.py --config camera_config.json --duration 60`
+  - **Run from dev box:** see "Launch / stop over SSH" above.
   - **Rebuild engine:** `./scripts/build_engine.sh yolov8n.onnx`
   - **Verify NVDEC:** `gst-inspect-1.0 nvv4l2decoder`
   - **Verify OpenCV+GStreamer:** `python3 -c "import cv2; print(cv2.getBuildInformation())" | grep -i gstreamer`
@@ -122,6 +186,12 @@ against recorded clips.
   literal string "nano_tracker" appears in the pkill command line and
   `-f` matches the whole command line.  Use a more specific pattern:
   `pkill -f "python3 -u nano_tracker"`.
+- **`pgrep -af 'python3 -u nano_tracker'` matches the bash wrapper** that
+  launched it -- because nohup'd shells keep the full python invocation
+  visible in their own argv.  Recipes that actually return just the python
+  PID: `ps -ef | awk '$8 ~ /python3/ && /nano_tracker/'` (filters on
+  argv[0]==python3), or `pgrep -f 'nano_tracker.py' -P 1` (orphaned by
+  nohup, so parent is init).
 - **`pycuda 2021.1` install** on JetPack 4.6 needs both build-isolation
   off and PEP 517 off, plus CUDA headers on CPATH for the C++ build:
   `CPATH=/usr/local/cuda/include pip install --user --no-build-isolation --no-use-pep517 pycuda==2021.1`.

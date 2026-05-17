@@ -96,17 +96,31 @@ class TrackPoint(NamedTuple):
     score: float
 
 
+_CROP_BUFFER_MAX = 12   # halve to ~6 when exceeded; bounds per-track memory
+_CROP_PAD_FRAC = 0.2    # pad bbox by 20% per side -- context for ALPR / OCR
+
+
+class CropSample(NamedTuple):
+    t: float            # seconds since session start
+    score: float        # YOLO detection confidence (used to pick color reference)
+    crop: np.ndarray    # padded BGR crop
+
+
 class Track(object):
     """Mutable per-vehicle state."""
-    __slots__ = ("id", "class_id", "points", "misses", "first_crop", "last_crop", "finalized")
+    __slots__ = ("id", "class_id", "points", "misses", "crops", "finalized")
 
     def __init__(self, track_id, class_id):
         self.id = track_id
         self.class_id = class_id
         self.points = []          # type: List[TrackPoint]
         self.misses = 0
-        self.first_crop = None    # type: Optional[np.ndarray]
-        self.last_crop = None     # type: Optional[np.ndarray]
+        # Padded crop samples spread across the track lifetime.  Capped at
+        # _CROP_BUFFER_MAX; on overflow we halve via [::2] so survivors still
+        # bracket the full duration.  Used at finalize-time to pick the
+        # mid-journey thumbnail, the highest-confidence HQ image (for ALPR),
+        # and color-vote samples.
+        self.crops = []           # type: List[CropSample]
         self.finalized = False
 
 
@@ -184,14 +198,12 @@ class IoUTracker(object):
                 self._append_point(self._active[tid], detections[di], frame, t, raw_frame)
 
         # Unmatched detections -> new tracks.
-        h, w = raw_frame.shape[:2]
         for i, d in enumerate(detections):
             if i in matched_dets:
                 continue
             tr = Track(self._next_id, d.class_id)
             self._next_id += 1
             self._append_point(tr, d, frame, t, raw_frame)
-            tr.first_crop = _safe_crop(raw_frame, d, w, h)
             self._active[tr.id] = tr
 
         # Tick misses on unmatched tracks, finalize expired.
@@ -222,15 +234,51 @@ class IoUTracker(object):
         cy = (d.y1 + d.y2) / 2.0
         tr.points.append(TrackPoint(frame, t, cx, cy, d.x1, d.y1, d.x2, d.y2, d.score))
         h, w = raw_frame.shape[:2]
-        crop = _safe_crop(raw_frame, d, w, h)
+        crop = _safe_crop(raw_frame, d, w, h, pad_frac=_CROP_PAD_FRAC)
         if crop is not None:
-            tr.last_crop = crop
+            tr.crops.append(CropSample(t, d.score, crop))
+            if len(tr.crops) > _CROP_BUFFER_MAX:
+                tr.crops = tr.crops[::2]
 
 
-def _safe_crop(frame, d, w, h):
-    # type: (np.ndarray, Detection, int, int) -> Optional[np.ndarray]
-    x1 = max(0, int(d.x1)); y1 = max(0, int(d.y1))
-    x2 = min(w, int(d.x2)); y2 = min(h, int(d.y2))
+# ----------------------------------------------------------------------
+# IR / night-mode detection
+#
+# Reolink switches to IR LEDs at night, producing a monochrome image (R=G=B).
+# YOLO trained on color images detects much less reliably in IR, and color
+# voting becomes meaningless.  Rather than waste inference budget and pollute
+# the JSON with low-quality IR-period entries, we detect this state per frame
+# and skip yolo.infer() entirely while in IR mode.  Decode keeps running so
+# RTSP buffer drains and we can detect the day-mode transition.
+# ----------------------------------------------------------------------
+
+_IR_CHANNEL_DIFF_THR = 8        # max per-pixel |R-G| / |G-B| for "monochrome"
+_IR_SAMPLE_STRIDE = 16          # downsample factor for the cheap check
+_IR_HYSTERESIS_FRAMES = 30      # consecutive readings before flipping state
+
+
+def is_ir_frame(frame, channel_diff_thr=_IR_CHANNEL_DIFF_THR, stride=_IR_SAMPLE_STRIDE):
+    # type: (np.ndarray, int, int) -> bool
+    """True if the frame looks like monochrome IR (R≈G≈B everywhere).
+
+    Stride-samples the frame for speed -- whole check is sub-millisecond on
+    the Nano even at full 1080p.  Threshold may need calibration if your
+    camera outputs tinted IR rather than pure mono (some Reolinks have a
+    faint greenish cast); raise the threshold to be more tolerant."""
+    s = frame[::stride, ::stride].astype(np.int16)
+    diff_rg = int(np.abs(s[:, :, 2] - s[:, :, 1]).max())
+    diff_gb = int(np.abs(s[:, :, 1] - s[:, :, 0]).max())
+    return diff_rg <= channel_diff_thr and diff_gb <= channel_diff_thr
+
+
+def _safe_crop(frame, d, w, h, pad_frac=0.0):
+    # type: (np.ndarray, Detection, int, int, float) -> Optional[np.ndarray]
+    """Crop the detection's bbox, optionally padded by pad_frac of its size on
+    each side (clamped to frame bounds for vehicles near edges)."""
+    px = (d.x2 - d.x1) * pad_frac
+    py = (d.y2 - d.y1) * pad_frac
+    x1 = max(0, int(d.x1 - px)); y1 = max(0, int(d.y1 - py))
+    x2 = min(w, int(d.x2 + px)); y2 = min(h, int(d.y2 + py))
     if x2 <= x1 or y2 <= y1:
         return None
     return frame[y1:y2, x1:x2].copy()
@@ -240,32 +288,95 @@ def _safe_crop(frame, d, w, h):
 # Attribute computation (mirrors VehicleTracker/main.py:compute_attributes)
 # ----------------------------------------------------------------------
 
+# HSV color ranges, ordered low->high inclusive.
+# Tuned for sub-stream (896x512) H.264-compressed traffic footage where
+# chromatic colors lose saturation (e.g. burgundy red sits around S=80, V=60).
+# `black` is intentionally restricted to chromaticity-free dark (S<40 AND V<40)
+# so dark windows / wheel arches on a chromatic car don't outvote the paint.
 COLOR_RANGES = [
-    ((0, 0, 200),    (180, 30, 255),  "white"),
-    ((0, 0, 0),      (180, 255, 50),  "black"),
-    ((0, 0, 51),     (180, 40, 199),  "grey"),
-    ((0, 100, 51),   (10, 255, 255),  "red"),
-    ((170, 100, 51), (180, 255, 255), "red"),
-    ((100, 100, 51), (130, 255, 255), "blue"),
-    ((36, 100, 51),  (85, 255, 255),  "green"),
-    ((20, 50, 180),  (30, 150, 255),  "silver"),
-    ((20, 100, 100), (35, 255, 255),  "yellow"),
+    ((0, 0, 200),   (180, 30, 255),  "white"),
+    ((0, 0, 0),     (180, 40, 40),   "black"),    # tightened: was V<50 any S
+    ((0, 0, 40),    (180, 40, 200),  "grey"),     # extended down: was V>=51
+    ((0, 60, 50),   (10, 255, 255),  "red"),      # Sat floor 60: was 100
+    ((170, 60, 50), (180, 255, 255), "red"),
+    ((100, 80, 50), (130, 255, 255), "blue"),
+    ((36, 80, 50),  (85, 255, 255),  "green"),
+    ((20, 50, 180), (30, 150, 255),  "silver"),
+    ((20, 80, 80),  (35, 255, 255),  "yellow"),
 ]
 
+_ACHROMATIC = frozenset(("white", "black", "grey", "silver"))
+_CHROMATIC_PREFER_FRAC = 0.15  # when grey is the achromatic plurality, a
+                               # chromatic >= this fraction of voted pixels
+                               # wins (catches "real color buried under
+                               # road-grey background").
+_COLOR_MIN_INNER_PIXELS = 2000 # below this, the bbox is too tiny for the
+                               # color vote to be reliable (a handful of
+                               # sky-reflection pixels swings the result) --
+                               # return "unknown" honestly.
 
-def get_dominant_color(crops):
-    # type: (List[np.ndarray]) -> str
+
+def vote_color(crop, pad_frac=_CROP_PAD_FRAC):
+    # type: (Optional[np.ndarray], float) -> str
+    """Pick a vehicle color from a *padded* crop.
+
+    Heuristics on top of plain HSV-range voting:
+
+    1. Strip the padding before counting -- otherwise grey road/curb pixels
+       (~30-40% of a padded crop) drown out the paint.
+    2. Return "unknown" if the inner crop is below _COLOR_MIN_INNER_PIXELS --
+       sub-2k-pixel bboxes can't be voted reliably (a few sky reflections in
+       a 1000-pixel crop can swing the result; see distant-lane tracks).
+    3. **white** or **black** plurality wins outright.  These are strong-
+       signal categories (V>=200 S<30 / V<40 S<40) -- a real white or black
+       car produces many pixels matching, and we should trust that over any
+       reflection/shadow chromatic noise (the previous rule of "any
+       chromatic >=15% wins" mis-categorised obvious white cars as blue
+       because window+sky reflections add up to ~20%).
+    4. Otherwise the achromatic plurality is grey/silver -- weak achromatic
+       signal that often masks a desaturated chromatic body.  Then a
+       chromatic with >= _CHROMATIC_PREFER_FRAC of the vote wins (this is
+       the case the rule was actually designed for: burgundy red car whose
+       body reads as mostly grey but has a clear chromatic minority).
+    """
     import cv2  # type: ignore
-    counts = {}  # type: Dict[str, int]
-    for crop in crops:
-        if crop is None or crop.size == 0:
-            continue
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        for low, high, name in COLOR_RANGES:
-            m = cv2.inRange(hsv, np.array(low), np.array(high))
-            counts[name] = counts.get(name, 0) + int(cv2.countNonZero(m))
-    if not counts:
+    if crop is None or crop.size == 0:
         return "unknown"
+    # The crop was made with `_safe_crop(..., pad_frac=p)`, which grew the
+    # bbox by p on each side.  Padded extent is (1 + 2p) x bbox.  Original
+    # bbox sits centered with `p / (1 + 2p)` inset on each side.
+    h, w = crop.shape[:2]
+    inset_x = int(w * pad_frac / (1.0 + 2.0 * pad_frac))
+    inset_y = int(h * pad_frac / (1.0 + 2.0 * pad_frac))
+    inner = crop[inset_y:max(inset_y + 1, h - inset_y),
+                 inset_x:max(inset_x + 1, w - inset_x)]
+    if inner.size == 0 or (inner.shape[0] * inner.shape[1]) < _COLOR_MIN_INNER_PIXELS:
+        return "unknown"
+
+    hsv = cv2.cvtColor(inner, cv2.COLOR_BGR2HSV)
+    counts = {}  # type: Dict[str, int]
+    for low, high, name in COLOR_RANGES:
+        m = cv2.inRange(hsv, np.array(low), np.array(high))
+        counts[name] = counts.get(name, 0) + int(cv2.countNonZero(m))
+    total = sum(counts.values())
+    if total == 0:
+        return "unknown"
+
+    chromatic = {k: v for k, v in counts.items() if k not in _ACHROMATIC}
+    achromatic = {k: v for k, v in counts.items() if k in _ACHROMATIC}
+    best_chrom_count = max(chromatic.values()) if chromatic else 0
+
+    # White/black plurality wins outright over any chromatic.
+    if achromatic:
+        best_ach_name = max(achromatic, key=lambda k: achromatic[k])
+        if best_ach_name in ("white", "black") and achromatic[best_ach_name] > best_chrom_count:
+            return best_ach_name
+
+    # Grey/silver plurality: defer to dominant chromatic if substantive.
+    if chromatic:
+        best_chrom_name = max(chromatic, key=lambda k: chromatic[k])
+        if chromatic[best_chrom_name] >= _CHROMATIC_PREFER_FRAC * total:
+            return best_chrom_name
     return max(counts, key=lambda k: counts[k])
 
 
@@ -279,16 +390,20 @@ def total_displacement(points):
     return tot
 
 
-def format_time(seconds):
+def format_wall(unix_ts):
     # type: (float) -> str
-    h = int(seconds) // 3600
-    m = (int(seconds) % 3600) // 60
-    s = int(seconds) % 60
-    return "{:02d}:{:02d}:{:02d}".format(h, m, s)
+    """Local-time ISO 8601 with timezone offset, e.g. '2026-05-17T14:32:05+01:00'.
+
+    Used for time_start / time_end in vehicle records so a daylong analysis
+    can see when in real time each capture happened, rather than seconds
+    since session start.  Python 3.6 has datetime.astimezone() with no
+    argument (defaults to local tz)."""
+    import datetime
+    return datetime.datetime.fromtimestamp(unix_ts).astimezone().isoformat(timespec="seconds")
 
 
-def compute_attributes(tr, frame_h, min_duration_s, parked_disp_px):
-    # type: (Track, int, float, float) -> Optional[dict]
+def compute_attributes(tr, frame_h, min_duration_s, parked_disp_px, color, t_start_wall):
+    # type: (Track, int, float, float, str, float) -> Optional[dict]
     if len(tr.points) < 2:
         return None
     duration = tr.points[-1].t - tr.points[0].t
@@ -297,27 +412,28 @@ def compute_attributes(tr, frame_h, min_duration_s, parked_disp_px):
 
     p0, pN = tr.points[0], tr.points[-1]
     net_disp = ((pN.cx - p0.cx) ** 2 + (pN.cy - p0.cy) ** 2) ** 0.5
+    if net_disp < parked_disp_px:
+        return None  # parked: not logged
+
     disp = total_displacement(tr.points)
     speed_px_s = net_disp / duration if duration > 0 else 0.0
     direction = "left to right" if pN.cx > p0.cx else "right to left"
 
-    color = get_dominant_color([c for c in (tr.first_crop, tr.last_crop) if c is not None])
-
     avg_y = sum(p.cy for p in tr.points) / len(tr.points)
     third = frame_h / 3.0
     lane = "top" if avg_y < third else ("middle" if avg_y < 2 * third else "bottom")
-
-    parked = net_disp < parked_disp_px
 
     avg_conf = sum(p.score for p in tr.points) / len(tr.points)
     return {
         "track_id": tr.id,
         "class_id": tr.class_id,
         "class_name": CLASS_NAMES.get(tr.class_id, "unknown"),
+        "time_start": format_wall(t_start_wall + p0.t),
+        "time_end": format_wall(t_start_wall + pN.t),
+        "time_start_unix": round(t_start_wall + p0.t, 2),
+        "time_end_unix": round(t_start_wall + pN.t, 2),
         "time_start_s": round(p0.t, 2),
         "time_end_s": round(pN.t, 2),
-        "time_start": format_time(p0.t),
-        "time_end": format_time(pN.t),
         "duration_visible": round(duration, 2),
         "direction": direction,
         "speed_px_s": round(speed_px_s, 1),
@@ -327,7 +443,6 @@ def compute_attributes(tr, frame_h, min_duration_s, parked_disp_px):
         "displacement_px": round(disp, 1),
         "net_displacement_px": round(net_disp, 1),
         "num_detections": len(tr.points),
-        "parked": parked,
     }
 
 
@@ -335,11 +450,11 @@ def compute_attributes(tr, frame_h, min_duration_s, parked_disp_px):
 # Output: JSON, thumbnails, HTML summary
 # ----------------------------------------------------------------------
 
-def save_thumbnail(crop, path):
-    # type: (np.ndarray, Path) -> bool
+def save_thumbnail(crop, path, quality=85):
+    # type: (np.ndarray, Path, int) -> bool
     try:
         import cv2  # type: ignore
-        return bool(cv2.imwrite(str(path), crop, [cv2.IMWRITE_JPEG_QUALITY, 85]))
+        return bool(cv2.imwrite(str(path), crop, [cv2.IMWRITE_JPEG_QUALITY, quality]))
     except Exception as e:  # pragma: no cover
         print("[output] thumbnail save failed for {}: {}".format(path, e))
         return False
@@ -347,123 +462,135 @@ def save_thumbnail(crop, path):
 
 def generate_html(attrs_list, output_dir, html_path, session_label, meta, refresh_seconds=15):
     # type: (List[dict], Path, Path, str, dict, int) -> None
+    """Render the session dashboard.
+
+    Always uses a virtualized renderer (server-emits JSON; browser renders
+    only the visible window).  This handles small sessions and 24h+ sessions
+    with thousands of rows equally well -- the DOM never grows past the
+    visible viewport's worth of rows."""
     import html as html_mod
 
     class_counts = {}  # type: Dict[str, int]
     for v in attrs_list:
         class_counts[v["class_name"]] = class_counts.get(v["class_name"], 0) + 1
-    moving = sum(1 for v in attrs_list if not v.get("parked"))
-    parked = sum(1 for v in attrs_list if v.get("parked"))
     parts = ["{} {}{}".format(c, n, "s" if c != 1 else "") for n, c in sorted(class_counts.items())]
-    counts_str = "{} moving, {} parked".format(moving, parked) if parked else "{} moving".format(moving)
-    summary_text = "{} vehicle{} ({}): {}".format(
-        len(attrs_list), "s" if len(attrs_list) != 1 else "", counts_str, ", ".join(parts)
+    summary_text = "{} vehicle{}: {}".format(
+        len(attrs_list), "s" if len(attrs_list) != 1 else "", ", ".join(parts)
     ) if attrs_list else "No vehicles detected"
 
-    no_img = ('<div style="width:80px;height:54px;background:#333;border-radius:4px;'
-              'display:flex;align-items:center;justify-content:center;color:#666;font-size:0.7rem;">N/A</div>')
-    rows = []
-    for v in attrs_list:
-        imgs = []
-        # Relative paths: HTML and thumbnails share output_dir, so the
-        # browser fetches them as e.g. /vehicle_42_first.jpg.  This keeps
-        # HTML size bounded (no base64 reflate per regen) and lets the
-        # browser cache thumbnails across refreshes.
-        for label in ("first", "last"):
-            fname = "vehicle_{}_{}.jpg".format(v["track_id"], label)
-            tp = output_dir / fname
-            if tp.exists():
-                imgs.append('<img src="{}" style="max-width:80px;max-height:54px;border-radius:4px;" loading="lazy">'.format(fname))
-            else:
-                imgs.append(no_img)
-        thumb = '<div style="display:flex;gap:3px;">' + "".join(imgs) + "</div>"
-
-        is_parked = v.get("parked", False)
-        status = ('<span style="background:#553;color:#da5;padding:1px 6px;border-radius:3px;font-size:0.75rem;">parked</span>'
-                  if is_parked else
-                  '<span style="background:#354;color:#6c6;padding:1px 6px;border-radius:3px;font-size:0.75rem;">moving</span>')
-        row_style = ' style="opacity:0.6;background:#1f1f1f;"' if is_parked else ''
-        rows.append("""
-        <tr{rs}>
-          <td>{thumb}</td>
-          <td data-sort="{tid}">#{tid}</td>
-          <td>{st}</td>
-          <td>{cn}</td>
-          <td>{co}</td>
-          <td data-sort="{ts}">{tstart} &rarr; {tend}</td>
-          <td data-sort="{dur}">{dur}s</td>
-          <td>{dir}</td>
-          <td data-sort="{sp}">{sp} px/s</td>
-          <td>{ln}</td>
-          <td data-sort="{ac}">{ac:.3f}</td>
-        </tr>""".format(
-            rs=row_style, thumb=thumb, tid=v["track_id"], st=status,
-            cn=html_mod.escape(v["class_name"]), co=html_mod.escape(v["color"]),
-            ts=v["time_start_s"], tstart=v["time_start"], tend=v["time_end"],
-            dur=v["duration_visible"], dir=html_mod.escape(v["direction"]),
-            sp=v["speed_px_s"], ln=html_mod.escape(v["lane"]), ac=v["avg_confidence"],
-        ))
-    rows_joined = "\n".join(rows)
-
     meta_kv = " · ".join("{}: {}".format(k, v) for k, v in sorted(meta.items()))
-
     refresh_tag = '<meta http-equiv="refresh" content="{}">'.format(int(refresh_seconds)) if refresh_seconds > 0 else ''
 
-    page = """<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8">
-{refresh}
-<title>NanoTracker Summary -- {label}</title>
-<style>
-* {{ margin:0; padding:0; box-sizing:border-box; }}
-body {{ background:#1a1a1a; color:#e0e0e0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,monospace; padding:24px; }}
-h1 {{ font-size:1.4rem; margin-bottom:8px; }}
-.summary {{ font-size:0.9rem; color:#aaa; margin-bottom:8px; }}
-.meta {{ font-size:0.75rem; color:#777; margin-bottom:20px; font-family:monospace; }}
-table {{ border-collapse:collapse; width:100%; font-size:0.85rem; }}
-th, td {{ padding:8px 10px; text-align:left; border-bottom:1px solid #333; }}
-th {{ background:#252525; color:#ccc; cursor:pointer; user-select:none; position:sticky; top:0; }}
-th:hover {{ color:#fff; }}
-th.sorted-asc::after {{ content:" \\25B2"; }}
-th.sorted-desc::after {{ content:" \\25BC"; }}
-tr:hover {{ background:#252525; }}
-</style></head><body>
-<h1>NanoTracker Summary</h1>
-<div class="summary">Session: {label} &mdash; {summary}</div>
-<div class="meta">{meta}</div>
-<table id="t"><thead><tr>
-<th>Thumbnail</th><th data-col="1">ID</th><th data-col="2">Status</th><th data-col="3">Type</th>
-<th data-col="4">Color</th><th data-col="5">Time</th><th data-col="6">Duration</th>
-<th data-col="7">Direction</th><th data-col="8">Speed</th><th data-col="9">Lane</th>
-<th data-col="10">Confidence</th>
-</tr></thead><tbody>
-{rows}
-</tbody></table>
-<script>
-document.querySelectorAll('#t th[data-col]').forEach(th => {{
-  th.addEventListener('click', () => {{
-    const tb = document.querySelector('#t tbody');
-    const col = parseInt(th.dataset.col);
-    const rows = Array.from(tb.querySelectorAll('tr'));
-    const asc = !th.classList.contains('sorted-asc');
-    document.querySelectorAll('#t th').forEach(h => h.classList.remove('sorted-asc','sorted-desc'));
-    th.classList.add(asc ? 'sorted-asc' : 'sorted-desc');
-    rows.sort((a, b) => {{
-      const ca = a.children[col], cb = b.children[col];
-      let va = ca.dataset.sort !== undefined ? ca.dataset.sort : ca.textContent;
-      let vb = cb.dataset.sort !== undefined ? cb.dataset.sort : cb.textContent;
-      const na = parseFloat(va), nb = parseFloat(vb);
-      if (!isNaN(na) && !isNaN(nb)) return asc ? na - nb : nb - na;
-      return asc ? va.localeCompare(vb) : vb.localeCompare(va);
-    }});
-    rows.forEach(r => tb.appendChild(r));
-  }});
-}});
-</script></body></html>""".format(
-        refresh=refresh_tag,
-        label=html_mod.escape(session_label),
-        summary=html_mod.escape(summary_text),
-        meta=html_mod.escape(meta_kv),
-        rows=rows_joined,
+    # Serialize vehicle data to embed in the page.  Keep only the fields the
+    # row renderer needs to minimise page size.
+    data_json = json.dumps([
+        {
+            "track_id": v["track_id"],
+            "class_name": v["class_name"],
+            "color": v["color"],
+            "time_start": v["time_start"],
+            "time_start_unix": v["time_start_unix"],
+            "duration_visible": v["duration_visible"],
+            "direction": v["direction"],
+            "speed_px_s": v["speed_px_s"],
+            "lane": v["lane"],
+            "avg_confidence": v["avg_confidence"],
+        }
+        for v in attrs_list
+    ], separators=(",", ":"))
+
+    # Pre-format styles + script using string concatenation (NOT .format) to
+    # avoid CSS/JS brace collisions with .format() placeholders.
+    page = (
+        '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
+        + refresh_tag
+        + '<title>NanoTracker -- ' + html_mod.escape(session_label) + '</title>'
+        + '<style>'
+        + '*{margin:0;padding:0;box-sizing:border-box}'
+        + 'body{background:#1a1a1a;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,monospace;padding:24px}'
+        + 'h1{font-size:1.4rem;margin-bottom:8px}'
+        + '.summary{font-size:0.9rem;color:#aaa;margin-bottom:8px}'
+        + '.meta{font-size:0.75rem;color:#777;margin-bottom:20px;font-family:monospace}'
+        # 10-column grid: thumb 88, ID 56, Type 76, Color 76, Time 100, Duration 80, Direction 110, Speed 96, Lane 76, Conf 80
+        + '.thead,.row{display:grid;grid-template-columns:88px 56px 76px 76px 100px 80px 110px 96px 76px 80px;gap:10px;padding:8px 12px;align-items:center;font-size:0.85rem}'
+        + '.thead{background:#252525;color:#ccc;font-weight:600;border-bottom:1px solid #444;position:sticky;top:0;z-index:2}'
+        + '.thead span{cursor:pointer;user-select:none}'
+        + '.thead span:hover{color:#fff}'
+        + '.thead span.sk-asc::after{content:" \\25B2"}'
+        + '.thead span.sk-desc::after{content:" \\25BC"}'
+        + '.vp{height:85vh;overflow-y:auto;border:1px solid #333;position:relative}'
+        + '.spacer{position:relative}'
+        + '.row{position:absolute;left:0;right:0;border-bottom:1px solid #2a2a2a}'
+        + '.row:hover{background:#252525}'
+        + '.row img{max-width:80px;max-height:54px;border-radius:4px;display:block}'
+        + '.no-img{width:80px;height:54px;background:#333;border-radius:4px;display:flex;align-items:center;justify-content:center;color:#666;font-size:0.7rem}'
+        + '</style></head><body>'
+        + '<h1>NanoTracker Summary</h1>'
+        + '<div class="summary">Session: ' + html_mod.escape(session_label) + ' &mdash; ' + html_mod.escape(summary_text) + '</div>'
+        + '<div class="meta">' + html_mod.escape(meta_kv) + '</div>'
+        + '<div class="vp" id="vp">'
+        + '  <div class="thead">'
+        + '    <span>Thumbnail</span>'
+        + '    <span data-sk="track_id">ID</span>'
+        + '    <span data-sk="class_name">Type</span>'
+        + '    <span data-sk="color">Color</span>'
+        + '    <span data-sk="time_start_unix" class="sk-desc">Time</span>'
+        + '    <span data-sk="duration_visible">Duration</span>'
+        + '    <span data-sk="direction">Direction</span>'
+        + '    <span data-sk="speed_px_s">Speed</span>'
+        + '    <span data-sk="lane">Lane</span>'
+        + '    <span data-sk="avg_confidence">Conf</span>'
+        + '  </div>'
+        + '  <div class="spacer" id="spacer"><div id="rows"></div></div>'
+        + '</div>'
+        + '<script id="vehicles-data" type="application/json">' + data_json + '</script>'
+        + '<script>'
+        + 'const DATA=JSON.parse(document.getElementById("vehicles-data").textContent);'
+        + 'const ROW_H=72;'
+        + 'let sortKey="time_start_unix",sortAsc=false;'
+        + 'let sorted=DATA.slice();'
+        + 'const VP=document.getElementById("vp"),SPACER=document.getElementById("spacer"),ROWS=document.getElementById("rows");'
+        + 'function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",\'"\':"&quot;"}[c]))}'
+        + 'function sortData(){sorted.sort((a,b)=>{let va=a[sortKey],vb=b[sortKey];if(typeof va==="number")return sortAsc?va-vb:vb-va;va=String(va);vb=String(vb);return sortAsc?va.localeCompare(vb):vb.localeCompare(va)})}'
+        + 'function rowHtml(v,i){'
+        +   'const t=(v.time_start||"").substr(11,8);'
+        +   'const thumb="vehicle_"+v.track_id+".jpg";'
+        +   'const hq="vehicle_"+v.track_id+"_hq.jpg";'
+        +   'return `<div class="row" style="top:${i*ROW_H}px">'
+        +     '<a href="${hq}" target="_blank" title="open full-quality crop"><img src="${thumb}" loading="lazy"></a>'
+        +     '<span>#${v.track_id}</span>'
+        +     '<span>${esc(v.class_name)}</span>'
+        +     '<span>${esc(v.color)}</span>'
+        +     '<span title="${esc(v.time_start)}">${t}</span>'
+        +     '<span>${v.duration_visible}s</span>'
+        +     '<span>${esc(v.direction)}</span>'
+        +     '<span>${v.speed_px_s} px/s</span>'
+        +     '<span>${esc(v.lane)}</span>'
+        +     '<span>${v.avg_confidence.toFixed(3)}</span>'
+        +   '</div>`'
+        + '}'
+        + 'function render(){'
+        +   'SPACER.style.height=(sorted.length*ROW_H)+"px";'
+        +   'const top=VP.scrollTop,visH=VP.clientHeight;'
+        +   'const start=Math.max(0,Math.floor(top/ROW_H)-5);'
+        +   'const end=Math.min(sorted.length,Math.ceil((top+visH)/ROW_H)+5);'
+        +   'let h="";for(let i=start;i<end;i++)h+=rowHtml(sorted[i],i);'
+        +   'ROWS.innerHTML=h;'
+        + '}'
+        + 'document.querySelectorAll(".thead span[data-sk]").forEach(s=>{'
+        +   's.addEventListener("click",()=>{'
+        +     'const k=s.dataset.sk;'
+        +     'if(sortKey===k)sortAsc=!sortAsc;else{sortKey=k;sortAsc=true}'
+        +     'document.querySelectorAll(".thead span").forEach(x=>x.classList.remove("sk-asc","sk-desc"));'
+        +     's.classList.add(sortAsc?"sk-asc":"sk-desc");'
+        +     'sortData();render();'
+        +   '});'
+        + '});'
+        + 'VP.addEventListener("scroll",render);'
+        + 'window.addEventListener("resize",render);'
+        + 'sortData();render();'
+        + '</script>'
+        + '</body></html>'
     )
     html_path.write_text(page, encoding="utf-8")
 
@@ -477,11 +604,53 @@ document.querySelectorAll('#t th[data-col]').forEach(th => {{
         )
 
 
-def save_json(attrs_list, meta, json_path):
-    # type: (List[dict], dict, Path) -> None
-    json_path.write_text(json.dumps({"metadata": meta, "vehicles": attrs_list}, indent=2),
-                         encoding="utf-8")
-    print("[output] JSON data: {}".format(json_path))
+def build_hourly_rollup(attrs_list, ir_periods):
+    # type: (List[dict], List[dict]) -> dict
+    """Bucket vehicles by wall-clock hour and summarise per-hour counts.
+
+    Returns: {"hours": [{...per hour...}], "ir_periods": [...]}
+    Each hour entry has hour ISO key, total count, and breakdowns by
+    class / color / direction / lane.  IR periods are included alongside
+    so 'no cars seen this hour' can be told apart from 'we were asleep'.
+    """
+    import datetime
+    by_hour = {}  # type: Dict[str, dict]
+    for v in attrs_list:
+        unix_ts = v.get("time_start_unix")
+        if unix_ts is None:
+            continue
+        hour_unix = int(unix_ts // 3600) * 3600
+        hour_key = datetime.datetime.fromtimestamp(hour_unix).astimezone().isoformat(timespec="hours")
+        bucket = by_hour.get(hour_key)
+        if bucket is None:
+            bucket = {
+                "hour": hour_key,
+                "count": 0,
+                "by_class": {},
+                "by_color": {},
+                "by_direction": {},
+                "by_lane": {},
+            }
+            by_hour[hour_key] = bucket
+        bucket["count"] += 1
+        for field, key in (("by_class", "class_name"), ("by_color", "color"),
+                           ("by_direction", "direction"), ("by_lane", "lane")):
+            val = v.get(key, "unknown")
+            bucket[field][val] = bucket[field].get(val, 0) + 1
+    return {
+        "hours": sorted(by_hour.values(), key=lambda b: b["hour"]),
+        "ir_periods": ir_periods,
+    }
+
+
+def save_json(attrs_list, meta, data_path, meta_path):
+    # type: (List[dict], dict, Path, Path) -> None
+    """Write the vehicles array as a bare top-level array (for jq / pandas /
+    SQL ingestion), with session metadata in a sibling file."""
+    data_path.write_text(json.dumps(attrs_list, indent=2), encoding="utf-8")
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    print("[output] JSON data: {}".format(data_path))
+    print("[output] JSON meta: {}".format(meta_path))
 
 
 class EventLog(object):
@@ -662,6 +831,7 @@ def run(args):
     events_path = output_dir / "{}_events.jsonl".format(session_label)
     html_path = output_dir / "{}_summary.html".format(session_label)
     final_json_path = output_dir / "{}_data.json".format(session_label)
+    meta_json_path = output_dir / "{}_meta.json".format(session_label)
     event_log = EventLog(events_path)
     print("[main] Event log:    {}".format(events_path))
     print("[main] HTML summary: {} (regenerated on idle)".format(html_path))
@@ -716,6 +886,7 @@ def run(args):
     signal.signal(signal.SIGTERM, handle_sig)
 
     t_start = time.monotonic()
+    t_start_wall = time.time()  # for wall-clock timestamps in JSON
     deadline = t_start + args.duration if args.duration > 0 else None
 
     save_thumbs = bool(out_cfg.get("save_thumbnails", True))
@@ -723,9 +894,11 @@ def run(args):
     parked_disp = float(trk_cfg.get("parked_displacement_px", 50.0))
     html_idle_s = float(out_cfg.get("html_idle_seconds", 10.0))
     html_refresh_s = int(out_cfg.get("html_refresh_seconds", 15))
+    heartbeat_interval = float(out_cfg.get("heartbeat_interval_s", 5.0))
 
     # Mutable runtime state (closed over by finalize / write_html / current_meta).
     frame_idx = 0
+    frames_inferred = 0   # frames where yolo.infer() actually ran (excludes IR)
     frame_h = 0
     attrs_list = []       # type: List[dict]
     raw_track_count = 0   # finalized tracks before min-duration filter
@@ -733,20 +906,47 @@ def run(args):
     html_dirty = False
     html_writes = 0
     last_log = t_start
+    last_heartbeat = 0.0
+    heartbeat_path = output_dir / ".heartbeat"
+
+    # Reconnect state (RTSP only): wall-clock-based session_t makes per-conn
+    # generator restarts transparent to the rest of the pipeline.
+    is_file_source = getattr(src, "is_file", False)
+    reconnect_backoff = 1.0  # seconds, doubles to 30 max on persistent failure
+
+    # IR / night-mode state (see is_ir_frame() for rationale).
+    ir_history = []       # type: List[bool]
+    ir_mode = False
+    ir_period_start_wall = None  # type: Optional[float]
+    ir_periods = []       # type: List[dict]   # {start, end, duration_s}
 
     def current_meta():
         elapsed_ = time.monotonic() - t_start
+        # Include any open IR period as still in-progress so consumers can see
+        # it without waiting for a transition out.
+        ir_out = list(ir_periods)
+        if ir_period_start_wall is not None:
+            ir_out.append({
+                "start": format_wall(ir_period_start_wall),
+                "end": None,
+                "duration_s": round(time.time() - ir_period_start_wall, 1),
+            })
         return {
             "session_label": session_label,
+            "session_start": format_wall(t_start_wall),
+            "session_start_unix": round(t_start_wall, 2),
             "rtsp_codec": codec,
             "engine": engine_path,
             "input_size": yolo.input_size,
-            "frames_processed": frame_idx + 1,
+            "frames_processed": frame_idx,
+            "frames_inferred": frames_inferred,
             "duration_s": round(elapsed_, 1),
-            "pipe_fps": round((frame_idx + 1) / elapsed_, 2) if elapsed_ > 0 else 0.0,
+            "pipe_fps": round(frame_idx / elapsed_, 2) if elapsed_ > 0 else 0.0,
             "avg_infer_ms": round(yolo.avg_infer_ms, 2),
             "html_writes": html_writes,
             "raw_track_count": raw_track_count,
+            "ir_periods": ir_out,
+            "ir_mode_active": ir_mode,
         }
 
     def finalize(tr):
@@ -754,14 +954,36 @@ def run(args):
         """Compute attrs for a finalized track, persist, and update HTML state."""
         nonlocal raw_track_count, last_finalize_time, html_dirty
         raw_track_count += 1
-        attrs = compute_attributes(tr, frame_h or 1080, min_duration, parked_disp)
+        # Largest-bbox crop = most pixels on the vehicle.  Used both as the
+        # HQ click-through image AND as the input to color voting (more
+        # pixels => more reliable vote).  Previously HQ was a higher-quality
+        # encode of the mid-journey crop -- but for far-lane tracks the
+        # mid-journey crop is tiny and the HQ was just a marginally bigger
+        # JPEG of the same tiny image; user couldn't read plates from it.
+        # Picking the largest-bbox frame gives a meaningfully larger image
+        # for tracks where the car had a close pass.
+        best_crop = None  # type: Optional[np.ndarray]
+        color = "unknown"
+        if tr.crops:
+            best = max(tr.crops, key=lambda c: c.crop.shape[0] * c.crop.shape[1])
+            best_crop = best.crop
+            color = vote_color(best_crop)
+        attrs = compute_attributes(tr, frame_h or 1080, min_duration, parked_disp, color, t_start_wall)
         if attrs is None:
-            return  # filtered out by min duration
-        if save_thumbs:
-            if tr.first_crop is not None:
-                save_thumbnail(tr.first_crop, output_dir / "vehicle_{}_first.jpg".format(tr.id))
-            if tr.last_crop is not None:
-                save_thumbnail(tr.last_crop, output_dir / "vehicle_{}_last.jpg".format(tr.id))
+            return  # filtered: too short, or parked
+        if save_thumbs and tr.crops:
+            # Two crops per vehicle:
+            #   vehicle_<id>.jpg     mid-journey crop @ q=85 -- dashboard tile;
+            #                        mid-journey tends to have the best plate
+            #                        angle (car square-on, not broadside).
+            #   vehicle_<id>_hq.jpg  largest-bbox crop @ q=95 -- click-through
+            #                        full-resolution; most pixels on vehicle
+            #                        for inspection / ALPR / future re-color.
+            midpoint_t = (tr.points[0].t + tr.points[-1].t) / 2.0
+            mid = min(tr.crops, key=lambda c: abs(c.t - midpoint_t)).crop
+            save_thumbnail(mid, output_dir / "vehicle_{}.jpg".format(tr.id))
+            if best_crop is not None:
+                save_thumbnail(best_crop, output_dir / "vehicle_{}_hq.jpg".format(tr.id), quality=95)
         event_log.append(attrs)
         attrs_list.append(attrs)
         last_finalize_time = time.monotonic()
@@ -774,37 +996,94 @@ def run(args):
                       current_meta(), refresh_seconds=html_refresh_s)
         html_dirty = False
 
-    try:
-        for frame_idx, t, frame in src.frames():
-            # ``t`` semantics:
-            #   - RTSP source: wall-clock seconds since first frame
-            #   - File source: video time (frame_idx / fps) -- keeps speed/duration
-            #     attributes meaningful even when the Nano processes faster or
-            #     slower than realtime.
-            if frame_h == 0:
-                frame_h = frame.shape[0]
+    def process_frame(conn_t, frame):
+        # type: (float, np.ndarray) -> None
+        """Per-frame body: IR check, inference, tracking, idle HTML, heartbeat,
+        status log.  Mutates loop-state through nonlocal closure vars."""
+        nonlocal frame_idx, frames_inferred, frame_h
+        nonlocal ir_mode, ir_period_start_wall, last_finalize_time
+        nonlocal html_dirty, last_log, last_heartbeat
 
+        frame_idx += 1
+        if frame_h == 0:
+            frame_h = frame.shape[0]
+
+        # ``session_t`` is wall-clock seconds since session start for RTSP
+        # (so reconnects keep a single contiguous timeline) and video-time
+        # for file sources (so durations stay meaningful even when the Nano
+        # processes faster or slower than realtime).
+        if is_file_source:
+            session_t = conn_t
+        else:
+            session_t = time.time() - t_start_wall
+
+        # IR / night-mode check with hysteresis.
+        ir_history.append(is_ir_frame(frame))
+        if len(ir_history) > _IR_HYSTERESIS_FRAMES:
+            ir_history.pop(0)
+        if len(ir_history) == _IR_HYSTERESIS_FRAMES:
+            if not ir_mode and all(ir_history):
+                ir_mode = True
+                ir_period_start_wall = time.time()
+                print("[mode] entering IR/night at {} -- skipping inference".format(
+                    format_wall(ir_period_start_wall),
+                ))
+                # Cut active tracks cleanly across the day/night boundary.
+                for tr in tracker.flush():
+                    finalize(tr)
+            elif ir_mode and not any(ir_history):
+                end_wall = time.time()
+                ir_periods.append({
+                    "start": format_wall(ir_period_start_wall),
+                    "end": format_wall(end_wall),
+                    "duration_s": round(end_wall - ir_period_start_wall, 1),
+                })
+                ir_period_start_wall = None
+                ir_mode = False
+                print("[mode] returning to day at {} -- resuming inference".format(
+                    format_wall(end_wall),
+                ))
+
+        now = time.monotonic()
+
+        if not ir_mode:
             dets = yolo.infer(frame)
-            expired = tracker.update(dets, frame_idx, t, frame)
+            frames_inferred += 1
+            expired = tracker.update(dets, frame_idx, session_t, frame)
             for tr in expired:
                 finalize(tr)
+        else:
+            dets = []
 
-            now = time.monotonic()
+        # Idle-triggered HTML regen: at least one track has finalized AND
+        # `html_idle_s` seconds have passed since the most recent
+        # finalization.  We deliberately do NOT require `len(active) == 0`:
+        # scenes with permanently parked vehicles never empty out, which
+        # would block HTML updates forever.  "Idle" here means "no new
+        # finalizations recently", not "scene completely empty".
+        if (html_dirty
+                and not args.no_html
+                and (now - last_finalize_time) >= html_idle_s):
+            write_html()
 
-            # Idle-triggered HTML regen: at least one track has finalized AND
-            # `html_idle_s` seconds have passed since the most recent
-            # finalization.  We deliberately do NOT require `len(active) == 0`:
-            # scenes with permanently parked vehicles never empty out, which
-            # would block HTML updates forever.  "Idle" here means "no new
-            # finalizations recently", not "scene completely empty".
-            if (html_dirty
-                    and not args.no_html
-                    and (now - last_finalize_time) >= html_idle_s):
-                write_html()
+        if now - last_heartbeat >= heartbeat_interval:
+            try:
+                heartbeat_path.write_text(
+                    "{:.3f} {}\n".format(time.time(), "ir" if ir_mode else "day"),
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                print("[heartbeat] write failed: {}".format(exc))
+            last_heartbeat = now
 
-            if now - last_log >= 2.0:
-                elapsed = now - t_start
-                fps = (frame_idx + 1) / elapsed if elapsed > 0 else 0.0
+        log_every_s = 30.0 if ir_mode else 2.0
+        if now - last_log >= log_every_s:
+            elapsed = now - t_start
+            fps = frame_idx / elapsed if elapsed > 0 else 0.0
+            if ir_mode:
+                print("[main] f={fr:>5}  pipe_fps={pf:>5.1f}  IR-mode (inference paused)  "
+                      "done={dn:>4}".format(fr=frame_idx, pf=fps, dn=event_log.count))
+            else:
                 print(
                     "[main] f={fr:>5}  pipe_fps={pf:>5.1f}  infer={im:>5.1f}ms (avg {iem:>5.1f}ms)  "
                     "active={ac:>3}  done={dn:>4}  dets={nd:>2}  html={hw}".format(
@@ -812,21 +1091,84 @@ def run(args):
                         ac=len(tracker._active), dn=event_log.count, nd=len(dets), hw=html_writes,
                     )
                 )
-                last_log = now
+            last_log = now
 
-            if stop_flag["stop"] or (deadline is not None and now >= deadline):
+    try:
+        # Outer reconnect loop: only meaningful for RTSP; files run once.
+        while not stop_flag["stop"]:
+            try:
+                for _conn_idx, conn_t, frame in src.frames():
+                    process_frame(conn_t, frame)
+                    now_inner = time.monotonic()
+                    if stop_flag["stop"] or (deadline is not None and now_inner >= deadline):
+                        break
+                # Source generator returned naturally.
+                if is_file_source or stop_flag["stop"]:
+                    break
+                print("[rtsp] source ended after {} session frames; reconnecting in {:.1f}s".format(
+                    frame_idx, reconnect_backoff,
+                ))
+            except Exception as exc:
+                if is_file_source or stop_flag["stop"]:
+                    raise
+                print("[rtsp] source error: {}: {}; reconnecting in {:.1f}s".format(
+                    type(exc).__name__, exc, reconnect_backoff,
+                ))
+
+            if stop_flag["stop"]:
                 break
+
+            # Flush in-flight tracks: they had a discontinuity at disconnect.
+            for tr in tracker.flush():
+                finalize(tr)
+
+            # Sleep + reconnect with exponential backoff.
+            try:
+                src.close()
+            except Exception:
+                pass
+            time.sleep(reconnect_backoff)
+            try:
+                src.open()
+                reconnect_backoff = 1.0
+                print("[rtsp] reconnected.")
+            except Exception as exc:
+                reconnect_backoff = min(reconnect_backoff * 2.0, 30.0)
+                print("[rtsp] reopen failed: {}: {}; will retry (next backoff {:.1f}s)".format(
+                    type(exc).__name__, exc, reconnect_backoff,
+                ))
+                # Loop back to try again.
+                continue
     finally:
         # Flush any in-flight tracks (still active at shutdown).
         for tr in tracker.flush():
             finalize(tr)
+        # Close any open IR period so the metadata reflects a complete history.
+        if ir_period_start_wall is not None:
+            end_wall = time.time()
+            ir_periods.append({
+                "start": format_wall(ir_period_start_wall),
+                "end": format_wall(end_wall),
+                "duration_s": round(end_wall - ir_period_start_wall, 1),
+            })
+            ir_period_start_wall = None
+            ir_mode = False
         # Final consolidated outputs, regardless of dirty flag.
         if not args.no_html:
             write_html()
         if not args.no_json:
-            save_json(attrs_list, current_meta(), final_json_path)
+            save_json(attrs_list, current_meta(), final_json_path, meta_json_path)
+            hourly_path = output_dir / "{}_hourly.json".format(session_label)
+            hourly_path.write_text(
+                json.dumps(build_hourly_rollup(attrs_list, ir_periods), indent=2),
+                encoding="utf-8",
+            )
+            print("[output] Hourly:    {}".format(hourly_path))
         event_log.close()
-        src.close()
+        try:
+            src.close()
+        except Exception:
+            pass
         if http_server is not None:
             try:
                 http_server.shutdown()
@@ -834,15 +1176,15 @@ def run(args):
                 pass
 
     elapsed = time.monotonic() - t_start
-    pipe_fps = (frame_idx + 1) / elapsed if elapsed > 0 else 0.0
-    moving = sum(1 for v in attrs_list if not v.get("parked"))
-    parked = sum(1 for v in attrs_list if v.get("parked"))
-    print("\n[main] Loop ended.  {} frames in {:.1f}s -> {:.1f} pipe fps".format(
-        frame_idx + 1, elapsed, pipe_fps,
+    pipe_fps = frame_idx / elapsed if elapsed > 0 else 0.0
+    ir_total = sum(p.get("duration_s", 0.0) for p in ir_periods)
+    print("\n[main] Loop ended.  {} frames in {:.1f}s -> {:.1f} pipe fps "
+          "(inference ran on {} frames; IR-mode total {:.1f}s in {} periods)".format(
+        frame_idx, elapsed, pipe_fps, frames_inferred, ir_total, len(ir_periods),
     ))
-    print("[main] Summary: {} vehicles kept ({} moving, {} parked) from {} raw tracks. "
-          "HTML written {} times.".format(
-        len(attrs_list), moving, parked, raw_track_count, html_writes,
+    print("[main] Summary: {} moving vehicles kept from {} raw tracks "
+          "(filtered: too short or parked).  HTML written {} times.".format(
+        len(attrs_list), raw_track_count, html_writes,
     ))
 
 
