@@ -1,0 +1,70 @@
+{
+    "_comment": "Same schema as ReolinkDemo/camera_config.json so configs are portable. Copy to camera_config.json (gitignored) and fill in IP + password.",
+
+    "camera": {
+        "model": "Reolink RLC-1224A",
+        "ip": "192.168.1.XXX",
+        "username": "admin",
+        "password": ""
+    },
+
+    "ports": {
+        "http": 80,
+        "rtsp": 554
+    },
+
+    "streams": [
+        {
+            "name": "RTSP main (H.265)",
+            "quality": "main",
+            "codec": "h265",
+            "path": "/h264Preview_01_main"
+        },
+        {
+            "name": "RTSP sub (H.264)",
+            "quality": "sub",
+            "codec": "h264",
+            "path": "/h264Preview_01_sub"
+        }
+    ],
+
+    "_nano_defaults_comment": "On a Jetson Nano, default to the sub stream. Main is 4096x2784 H.265 ~30fps which costs ~33MB per raw frame after decode and starves the 4GB shared RAM. Sub stream is typically 640x480 H.264 which closely matches YOLOv8n's 640px input.",
+    "nano": {
+        "preferred_stream": "sub",
+        "rtsp_transport": "tcp",
+        "latency_ms": 200,
+        "decoder": "nvv4l2decoder"
+    },
+
+    "inference": {
+        "engine_path": "yolov8n_fp16.engine",
+        "input_size": 640,
+        "conf_threshold": 0.30,
+        "iou_threshold": 0.45,
+        "_vehicle_classes_comment": "COCO class IDs: 2=car, 3=motorcycle, 5=bus, 7=truck. Default is cars only; the engine still scores all 80 classes (no inference cost saving) but we discard non-car detections, which also eliminates cross-class false positives.",
+        "vehicle_classes": [2]
+    },
+
+    "tracking": {
+        "iou_match_threshold": 0.30,
+        "max_misses": 15,
+        "min_track_duration_s": 1.0,
+        "parked_displacement_px": 50.0
+    },
+
+    "output": {
+        "dir": "output",
+        "save_thumbnails": true,
+        "session_label_prefix": "session",
+        "_html_idle_seconds_comment": "HTML summary is regenerated when no tracks have been active for this many seconds AND at least one new track has finalized since the last regen. JSONL event log is appended on every finalization regardless.",
+        "html_idle_seconds": 10.0,
+        "html_refresh_seconds": 15
+    },
+
+    "http": {
+        "_comment": "Built-in dashboard server. The Nano serves the session output directory over HTTP so any device on your LAN can open http://<nano-ip>:<port>/. enabled=false (or --no-http on the CLI) disables it.",
+        "enabled": true,
+        "host": "0.0.0.0",
+        "port": 8080
+    }
+}

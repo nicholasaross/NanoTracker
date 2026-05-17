@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Project artifacts
+camera_config.json
+*.engine
+*.onnx
+*.pt
+output/
+snapshots/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

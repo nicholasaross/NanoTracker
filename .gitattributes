@@ -1,0 +1,5 @@
+# Force LF on shell scripts so they execute correctly on the Nano even when
+# cloned via a Windows working copy with core.autocrlf=true.
+*.sh        text eol=lf
+*.py        text eol=lf
+Makefile    text eol=lf

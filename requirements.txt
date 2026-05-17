@@ -1,0 +1,17 @@
+# Nano-side runtime dependencies (Python 3.6.9 on JetPack 4.6.1).
+#
+# DO NOT install torch / torchvision / ultralytics here.  The Nano runs
+# TensorRT inference directly via pycuda; the upstream PyTorch + ultralytics
+# stack is incompatible with Python 3.6 and JetPack 4.6's CUDA 10.2.
+#
+# DO NOT pip-install opencv-python here.  The system OpenCV from apt
+# (python3-opencv) is built with GStreamer + NVDEC support; a PyPI
+# opencv-python wheel would shadow it on the import path (~/.local takes
+# precedence over /usr/lib/python3/dist-packages) and break the NVDEC
+# pipeline.  setup_nano.sh installs the system package.
+#
+# tensorrt + pycuda + opencv come from JetPack apt packages.  See
+# docs/setup_nano.md for the install order.
+
+numpy<1.20            # last numpy that supports Python 3.6
+Pillow<9              # for thumbnail JPEG encoding fallback
