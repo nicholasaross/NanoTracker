@@ -96,17 +96,23 @@ class TrackPoint(NamedTuple):
     score: float
 
 
+_CROP_BUFFER_MAX = 12  # halve to ~6 when exceeded; bounds per-track memory
+
+
 class Track(object):
     """Mutable per-vehicle state."""
-    __slots__ = ("id", "class_id", "points", "misses", "first_crop", "last_crop", "finalized")
+    __slots__ = ("id", "class_id", "points", "misses", "crops", "finalized")
 
     def __init__(self, track_id, class_id):
         self.id = track_id
         self.class_id = class_id
         self.points = []          # type: List[TrackPoint]
         self.misses = 0
-        self.first_crop = None    # type: Optional[np.ndarray]
-        self.last_crop = None     # type: Optional[np.ndarray]
+        # (t, crop) samples spread across the track lifetime.  Capped at
+        # _CROP_BUFFER_MAX; on overflow we halve via [::2] so the surviving
+        # samples still bracket the full duration.  Used at finalize-time to
+        # pick a mid-journey thumbnail and to sample crops for color.
+        self.crops = []           # type: List[Tuple[float, np.ndarray]]
         self.finalized = False
 
 
@@ -184,14 +190,12 @@ class IoUTracker(object):
                 self._append_point(self._active[tid], detections[di], frame, t, raw_frame)
 
         # Unmatched detections -> new tracks.
-        h, w = raw_frame.shape[:2]
         for i, d in enumerate(detections):
             if i in matched_dets:
                 continue
             tr = Track(self._next_id, d.class_id)
             self._next_id += 1
             self._append_point(tr, d, frame, t, raw_frame)
-            tr.first_crop = _safe_crop(raw_frame, d, w, h)
             self._active[tr.id] = tr
 
         # Tick misses on unmatched tracks, finalize expired.
@@ -224,7 +228,9 @@ class IoUTracker(object):
         h, w = raw_frame.shape[:2]
         crop = _safe_crop(raw_frame, d, w, h)
         if crop is not None:
-            tr.last_crop = crop
+            tr.crops.append((t, crop))
+            if len(tr.crops) > _CROP_BUFFER_MAX:
+                tr.crops = tr.crops[::2]
 
 
 def _safe_crop(frame, d, w, h):
@@ -297,17 +303,25 @@ def compute_attributes(tr, frame_h, min_duration_s, parked_disp_px):
 
     p0, pN = tr.points[0], tr.points[-1]
     net_disp = ((pN.cx - p0.cx) ** 2 + (pN.cy - p0.cy) ** 2) ** 0.5
+    if net_disp < parked_disp_px:
+        return None  # parked: not logged
+
     disp = total_displacement(tr.points)
     speed_px_s = net_disp / duration if duration > 0 else 0.0
     direction = "left to right" if pN.cx > p0.cx else "right to left"
 
-    color = get_dominant_color([c for c in (tr.first_crop, tr.last_crop) if c is not None])
+    # Sample up to three crops (start, middle, end of retained buffer) for
+    # color voting -- enough variety without iterating the whole buffer.
+    if tr.crops:
+        idxs = sorted({0, len(tr.crops) // 2, len(tr.crops) - 1})
+        color_samples = [tr.crops[i][1] for i in idxs]
+    else:
+        color_samples = []
+    color = get_dominant_color(color_samples)
 
     avg_y = sum(p.cy for p in tr.points) / len(tr.points)
     third = frame_h / 3.0
     lane = "top" if avg_y < third else ("middle" if avg_y < 2 * third else "bottom")
-
-    parked = net_disp < parked_disp_px
 
     avg_conf = sum(p.score for p in tr.points) / len(tr.points)
     return {
@@ -327,7 +341,6 @@ def compute_attributes(tr, frame_h, min_duration_s, parked_disp_px):
         "displacement_px": round(disp, 1),
         "net_displacement_px": round(net_disp, 1),
         "num_detections": len(tr.points),
-        "parked": parked,
     }
 
 
@@ -352,42 +365,29 @@ def generate_html(attrs_list, output_dir, html_path, session_label, meta, refres
     class_counts = {}  # type: Dict[str, int]
     for v in attrs_list:
         class_counts[v["class_name"]] = class_counts.get(v["class_name"], 0) + 1
-    moving = sum(1 for v in attrs_list if not v.get("parked"))
-    parked = sum(1 for v in attrs_list if v.get("parked"))
     parts = ["{} {}{}".format(c, n, "s" if c != 1 else "") for n, c in sorted(class_counts.items())]
-    counts_str = "{} moving, {} parked".format(moving, parked) if parked else "{} moving".format(moving)
-    summary_text = "{} vehicle{} ({}): {}".format(
-        len(attrs_list), "s" if len(attrs_list) != 1 else "", counts_str, ", ".join(parts)
+    summary_text = "{} vehicle{}: {}".format(
+        len(attrs_list), "s" if len(attrs_list) != 1 else "", ", ".join(parts)
     ) if attrs_list else "No vehicles detected"
 
     no_img = ('<div style="width:80px;height:54px;background:#333;border-radius:4px;'
               'display:flex;align-items:center;justify-content:center;color:#666;font-size:0.7rem;">N/A</div>')
     rows = []
     for v in attrs_list:
-        imgs = []
-        # Relative paths: HTML and thumbnails share output_dir, so the
-        # browser fetches them as e.g. /vehicle_42_first.jpg.  This keeps
-        # HTML size bounded (no base64 reflate per regen) and lets the
-        # browser cache thumbnails across refreshes.
-        for label in ("first", "last"):
-            fname = "vehicle_{}_{}.jpg".format(v["track_id"], label)
-            tp = output_dir / fname
-            if tp.exists():
-                imgs.append('<img src="{}" style="max-width:80px;max-height:54px;border-radius:4px;" loading="lazy">'.format(fname))
-            else:
-                imgs.append(no_img)
-        thumb = '<div style="display:flex;gap:3px;">' + "".join(imgs) + "</div>"
+        # Single mid-journey thumbnail per vehicle.  Relative path: HTML and
+        # thumbnail share output_dir, so the browser fetches /vehicle_42.jpg
+        # and can cache it across refreshes.
+        fname = "vehicle_{}.jpg".format(v["track_id"])
+        tp = output_dir / fname
+        if tp.exists():
+            thumb = '<img src="{}" style="max-width:80px;max-height:54px;border-radius:4px;" loading="lazy">'.format(fname)
+        else:
+            thumb = no_img
 
-        is_parked = v.get("parked", False)
-        status = ('<span style="background:#553;color:#da5;padding:1px 6px;border-radius:3px;font-size:0.75rem;">parked</span>'
-                  if is_parked else
-                  '<span style="background:#354;color:#6c6;padding:1px 6px;border-radius:3px;font-size:0.75rem;">moving</span>')
-        row_style = ' style="opacity:0.6;background:#1f1f1f;"' if is_parked else ''
         rows.append("""
-        <tr{rs}>
+        <tr>
           <td>{thumb}</td>
           <td data-sort="{tid}">#{tid}</td>
-          <td>{st}</td>
           <td>{cn}</td>
           <td>{co}</td>
           <td data-sort="{ts}">{tstart} &rarr; {tend}</td>
@@ -397,7 +397,7 @@ def generate_html(attrs_list, output_dir, html_path, session_label, meta, refres
           <td>{ln}</td>
           <td data-sort="{ac}">{ac:.3f}</td>
         </tr>""".format(
-            rs=row_style, thumb=thumb, tid=v["track_id"], st=status,
+            thumb=thumb, tid=v["track_id"],
             cn=html_mod.escape(v["class_name"]), co=html_mod.escape(v["color"]),
             ts=v["time_start_s"], tstart=v["time_start"], tend=v["time_end"],
             dur=v["duration_visible"], dir=html_mod.escape(v["direction"]),
@@ -431,10 +431,10 @@ tr:hover {{ background:#252525; }}
 <div class="summary">Session: {label} &mdash; {summary}</div>
 <div class="meta">{meta}</div>
 <table id="t"><thead><tr>
-<th>Thumbnail</th><th data-col="1">ID</th><th data-col="2">Status</th><th data-col="3">Type</th>
-<th data-col="4">Color</th><th data-col="5">Time</th><th data-col="6">Duration</th>
-<th data-col="7">Direction</th><th data-col="8">Speed</th><th data-col="9">Lane</th>
-<th data-col="10">Confidence</th>
+<th>Thumbnail</th><th data-col="1">ID</th><th data-col="2">Type</th>
+<th data-col="3">Color</th><th data-col="4">Time</th><th data-col="5">Duration</th>
+<th data-col="6">Direction</th><th data-col="7">Speed</th><th data-col="8">Lane</th>
+<th data-col="9">Confidence</th>
 </tr></thead><tbody>
 {rows}
 </tbody></table>
@@ -477,11 +477,14 @@ document.querySelectorAll('#t th[data-col]').forEach(th => {{
         )
 
 
-def save_json(attrs_list, meta, json_path):
-    # type: (List[dict], dict, Path) -> None
-    json_path.write_text(json.dumps({"metadata": meta, "vehicles": attrs_list}, indent=2),
-                         encoding="utf-8")
-    print("[output] JSON data: {}".format(json_path))
+def save_json(attrs_list, meta, data_path, meta_path):
+    # type: (List[dict], dict, Path, Path) -> None
+    """Write the vehicles array as a bare top-level array (for jq / pandas /
+    SQL ingestion), with session metadata in a sibling file."""
+    data_path.write_text(json.dumps(attrs_list, indent=2), encoding="utf-8")
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    print("[output] JSON data: {}".format(data_path))
+    print("[output] JSON meta: {}".format(meta_path))
 
 
 class EventLog(object):
@@ -662,6 +665,7 @@ def run(args):
     events_path = output_dir / "{}_events.jsonl".format(session_label)
     html_path = output_dir / "{}_summary.html".format(session_label)
     final_json_path = output_dir / "{}_data.json".format(session_label)
+    meta_json_path = output_dir / "{}_meta.json".format(session_label)
     event_log = EventLog(events_path)
     print("[main] Event log:    {}".format(events_path))
     print("[main] HTML summary: {} (regenerated on idle)".format(html_path))
@@ -756,12 +760,11 @@ def run(args):
         raw_track_count += 1
         attrs = compute_attributes(tr, frame_h or 1080, min_duration, parked_disp)
         if attrs is None:
-            return  # filtered out by min duration
-        if save_thumbs:
-            if tr.first_crop is not None:
-                save_thumbnail(tr.first_crop, output_dir / "vehicle_{}_first.jpg".format(tr.id))
-            if tr.last_crop is not None:
-                save_thumbnail(tr.last_crop, output_dir / "vehicle_{}_last.jpg".format(tr.id))
+            return  # filtered: too short, or parked
+        if save_thumbs and tr.crops:
+            midpoint_t = (tr.points[0].t + tr.points[-1].t) / 2.0
+            best = min(tr.crops, key=lambda tc: abs(tc[0] - midpoint_t))[1]
+            save_thumbnail(best, output_dir / "vehicle_{}.jpg".format(tr.id))
         event_log.append(attrs)
         attrs_list.append(attrs)
         last_finalize_time = time.monotonic()
@@ -824,7 +827,7 @@ def run(args):
         if not args.no_html:
             write_html()
         if not args.no_json:
-            save_json(attrs_list, current_meta(), final_json_path)
+            save_json(attrs_list, current_meta(), final_json_path, meta_json_path)
         event_log.close()
         src.close()
         if http_server is not None:
@@ -835,14 +838,12 @@ def run(args):
 
     elapsed = time.monotonic() - t_start
     pipe_fps = (frame_idx + 1) / elapsed if elapsed > 0 else 0.0
-    moving = sum(1 for v in attrs_list if not v.get("parked"))
-    parked = sum(1 for v in attrs_list if v.get("parked"))
     print("\n[main] Loop ended.  {} frames in {:.1f}s -> {:.1f} pipe fps".format(
         frame_idx + 1, elapsed, pipe_fps,
     ))
-    print("[main] Summary: {} vehicles kept ({} moving, {} parked) from {} raw tracks. "
-          "HTML written {} times.".format(
-        len(attrs_list), moving, parked, raw_track_count, html_writes,
+    print("[main] Summary: {} moving vehicles kept from {} raw tracks "
+          "(filtered: too short or parked).  HTML written {} times.".format(
+        len(attrs_list), raw_track_count, html_writes,
     ))
 
 
