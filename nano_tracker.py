@@ -115,7 +115,8 @@ class Track(object):
     """Mutable per-vehicle state."""
     __slots__ = ("id", "class_id", "points", "misses", "crops", "finalized",
                  "hq_best_crop", "hq_best_score", "hq_best_area",
-                 "snap_count", "snap_saved_indexes", "last_snap_area")
+                 "snap_count", "snap_saved_indexes", "last_snap_area",
+                 "last_blur_skip_logged")
 
     def __init__(self, track_id, class_id):
         self.id = track_id
@@ -151,6 +152,9 @@ class Track(object):
         self.snap_count = 0
         self.snap_saved_indexes = []   # type: List[int]
         self.last_snap_area = 0.0
+        # Monotonic timestamp of the last "skipped fire due to blur" log line.
+        # Throttles per-track logging when a track stays blurry across many frames.
+        self.last_blur_skip_logged = 0.0
 
 
 # ----------------------------------------------------------------------
@@ -568,6 +572,7 @@ class ReolinkSnapshotter(object):
         self.successes = 0
         self.failures = 0
         self.dropped = 0
+        self.blur_skipped = 0
 
     def fetch_async(self, output_path, on_done=None):
         # type: (Path, Optional[callable]) -> None
@@ -1085,6 +1090,15 @@ def run(args):
     snap_cfg = cfg.get("snapshot", {})
     snap_enabled = bool(snap_cfg.get("enabled", True)) and not args.video
     snap_area_threshold = float(snap_cfg.get("area_threshold_frac", 0.05))
+    # Blur gate: skip the main-stream HTTP fire when the sub-stream bbox is too
+    # motion-blurred to be readable.  Value is the minimum variance-of-Laplacian
+    # on the 128px-downsampled bbox crop.  0 disables the gate (default).
+    # Typical observed values on daylight 896x512 sub-stream bbox crops:
+    #   sharp daylight :  ~100-400+
+    #   slight blur    :  ~30-80
+    #   heavy motion blur: ~5-20
+    # Start around 50 if enabling; tune from the [snap] track N skip logs.
+    snap_min_sharpness = float(snap_cfg.get("min_sharpness", 0.0))
     snap_growth_factor = float(snap_cfg.get("refire_growth_factor", 1.5))
     snap_max_per_track = int(snap_cfg.get("max_snaps_per_track", 3))
     snap_keep_days = int(snap_cfg.get("keep_days", 7))
@@ -1407,6 +1421,40 @@ def run(args):
                         # First-fire or re-fire on substantial growth.
                         if tr.last_snap_area > 0 and bbox_area < tr.last_snap_area * snap_growth_factor:
                             continue
+                        # Blur gate (opt-in).  Skips the HTTP fire when the bbox
+                        # is too motion-blurred to be readable.  Does NOT consume
+                        # a snap slot or update last_snap_area, so a still-blurry
+                        # track keeps re-checking each frame until either the
+                        # blur clears or the area drops below threshold again.
+                        #
+                        # Sharpness is measured on the *center 60%* of the bbox,
+                        # not the full bbox.  The YOLO box typically includes
+                        # background at the edges (road, foliage, wall corners)
+                        # whose sharp edges prop up the Laplacian variance even
+                        # when the vehicle interior is motion-smeared.  The
+                        # center crop concentrates on vehicle pixels.
+                        if snap_min_sharpness > 0.0:
+                            bx1 = max(0, int(p.x1)); by1 = max(0, int(p.y1))
+                            bx2 = min(fw_now, int(p.x2)); by2 = min(fh_now, int(p.y2))
+                            bw = bx2 - bx1; bh = by2 - by1
+                            if bw > 0 and bh > 0:
+                                mx = bw // 5; my = bh // 5  # 20% strip per side
+                                cx1 = bx1 + mx; cx2 = bx2 - mx
+                                cy1 = by1 + my; cy2 = by2 - my
+                                if cx2 > cx1 and cy2 > cy1:
+                                    sharp = _sharpness_score(frame[cy1:cy2, cx1:cx2])
+                                    if sharp < snap_min_sharpness:
+                                        snapshotter.blur_skipped += 1
+                                        if now - tr.last_blur_skip_logged >= 5.0:
+                                            print("[snap] track {} blur skip (sharp={:.0f} < {:.0f})".format(
+                                                tr.id, sharp, snap_min_sharpness))
+                                            tr.last_blur_skip_logged = now
+                                        continue
+                                    # Log the sharpness of the FIRST passing fire per
+                                    # track for threshold calibration.  No throttle:
+                                    # we want every track represented exactly once.
+                                    if tr.snap_count == 0:
+                                        print("[snap] track {} pass (sharp={:.0f})".format(tr.id, sharp))
                         tr.snap_count += 1
                         tr.last_snap_area = bbox_area
                         _fire_snapshot(snapshotter, tr, output_dir, tr.snap_count)
