@@ -66,5 +66,17 @@
         "enabled": true,
         "host": "0.0.0.0",
         "port": 8080
+    },
+
+    "snapshot": {
+        "_comment": "Main-stream HTTP snapshot fetcher. When a tracked target's bbox crosses area_threshold_frac of the sub-stream frame area, an async HTTP request to /cgi-bin/api.cgi?cmd=Snap fetches a full-resolution still (typically 4K on RLC-1224A) for inspection / ALPR. Re-fires every time bbox area grows by refire_growth_factor since the last fire, up to max_snaps_per_track total fires (each saved as <prefix>_<id>_main_<N>.jpg, prefix = 'person' or 'vehicle' per class). Linked from the dashboard via a 4K badge. Disabled automatically when --video is used. keep_days > 0 enables a background cleanup that deletes any *_main_*.jpg older than that many days, sweeping all sessions under output/ every cleanup_interval_s seconds; set keep_days=0 to disable cleanup.",
+        "enabled": true,
+        "area_threshold_frac": 0.05,
+        "refire_growth_factor": 1.5,
+        "max_snaps_per_track": 3,
+        "keep_days": 7,
+        "cleanup_interval_s": 3600,
+        "timeout_s": 5.0,
+        "max_concurrent": 2
     }
 }

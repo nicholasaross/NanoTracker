@@ -92,6 +92,20 @@ Gitignored on the dev side and Nano-only: `camera_config.json`, `*.engine`,
 `*.onnx`, `output/`.  TRT engines are not portable across GPU architectures --
 always build on the Nano.
 
+### Pull a capture batch from the Nano to the dev box
+
+```bash
+# from the dev box, in your worktree
+python scripts/pull_session.py                  # latest session -> ./output/
+python scripts/pull_session.py --only-main      # just 4K snaps + JSON (for ALPR)
+python scripts/pull_session.py --dry-run        # inventory only, no transfer
+```
+
+The script defaults match the SSH setup above (host=nano, user=claude,
+key=~/.ssh/nanotracker_claude) and lands files in `./output/<session>/`
+mirroring the Nano layout, so the local `summary.html` still resolves
+all its image links.
+
 ### Launch / stop over SSH
 
 ```bash
@@ -209,3 +223,112 @@ against recorded clips.
 Inference dominates (~76% of frame budget).  Decode path matters by ~2 FPS.
 To push above 13 FPS the real lever is `input_size` 640→512 (~+5 FPS) or
 640→416 (~+10 FPS) at some accuracy cost, not the decode pipeline.
+
+## Post-processing / analysis (phase 2+)
+
+The Nano produces metadata + assets; downstream ALPR / make-model
+classification / re-color / aggregation lives on the dev box.  Pull a
+session with `scripts/pull_session.py` (see above) and you'll have
+everything below in `./output/<session>/`.
+
+### Per-track asset schema
+
+The class-aware prefix is `vehicle` for cars (and any non-person class)
+or `person` for pedestrians.  Per finalized track:
+
+| File | Source | Quality | Use case |
+|---|---|---|---|
+| `<prefix>_<id>.jpg` | sub-stream, mid-journey bbox | q=85, ~80px wide | dashboard tile only; don't analyse |
+| `<prefix>_<id>_hq.jpg` | sub-stream, best-of-track | q=95, ~200-300px | quick color / silhouette checks |
+| `<prefix>_<id>_main_<N>.jpg` | Reolink HTTP `/cgi-bin/api.cgi?cmd=Snap` | 4K JPEG, ~2 MB | ALPR / make-model / fine color |
+
+`N` ranges 1..`max_snaps_per_track` (default 3).  Snaps fire at growing
+area thresholds (≥5%, then ≥1.5x prior fire), so the three frames are
+spaced across the close pass -- typically *approach / peak / departure*.
+The set is not guaranteed dense: very fast vehicles may only get N=1,
+distant tracks may get none.  Don't assume `_main_1` is the worst or
+`_main_3` is the best -- each is just a sample at a different bbox area;
+plate readability depends on motion blur and JPEG luck more than which N.
+
+Glob `output/session_*/{vehicle,person}_*_main_*.jpg` to ingest all
+high-resolution stills for a multi-day analysis run.  Filename regex:
+`r"^(?P<cls>person|vehicle)_(?P<tid>\d+)_main_(?P<n>\d+)\.jpg$"`.
+
+### JSON record schema
+
+`{session}_data.json` is a top-level array of records, one per
+finalized track.  `{session}_events.jsonl` is the same records, one per
+line, appended live.  Fields per record:
+
+  - **identity:** `track_id` (int, stable within session, resets across sessions),
+    `class_id` (int, COCO), `class_name` (str), `asset_prefix` ("person" or "vehicle").
+  - **time:** `time_start`/`time_end` (ISO-local with offset),
+    `time_start_unix`/`time_end_unix` (float), `time_start_s`/`time_end_s`
+    (float, seconds since session start), `duration_visible` (float seconds).
+  - **motion:** `direction` ("left to right" / "right to left"),
+    `speed_px_s` (float, pixels/s on sub-stream),
+    `displacement_px` (path length), `net_displacement_px` (straight-line),
+    `lane` ("top" / "middle" / "bottom" -- thirds of frame height).
+  - **detection:** `avg_confidence` (mean YOLO score), `num_detections`
+    (count of frames seen across the track).
+  - **attributes:** `color` (str, HSV-vote heuristic; see `vote_color()`
+    in `nano_tracker.py` -- expect "unknown" on small / IR-edge tracks).
+  - **assets:** `main_snaps` (list of int N values that succeeded to disk;
+    e.g. `[1, 2]` means `_main_1.jpg` and `_main_2.jpg` are present,
+    `_main_3.jpg` is not).
+
+`{session}_meta.json` has session-level fields: `session_start_unix`,
+`frames_processed`, `pipe_fps`, `avg_infer_ms`, `ir_periods` (list of
+`{start, end, duration_s}` for IR/night gaps -- inference was paused).
+
+`{session}_hourly.json` rolls up per-hour counts with `by_class`,
+`by_color`, `by_direction`, `by_lane` breakdowns plus IR-period gaps.
+
+### Constraints worth knowing
+
+  - **Main and sub stream FOV may differ.**  Reolink RLC-1224A sub
+    (896×512) and main (4096×2784) have different aspect ratios
+    (1.75:1 vs 1.47:1), so you cannot simply scale the sub-stream bbox
+    to locate the vehicle in the main snap.  `_main_*.jpg` is the
+    **uncropped 4K frame**, not a vehicle crop -- you need to re-detect
+    on the main snap (e.g. a larger YOLO model on the dev box) and crop
+    around the result.  Calibrating a mapping is unsolved.
+  - **Snap timestamp ≠ frame timestamp.**  The HTTP fetch round-trip
+    is 200-500ms, so the JPEG returned is the *current* main-stream frame
+    at the time the camera answers, not the sub-stream frame that
+    triggered the fire.  For a 30mph car this is ~5 m of motion -- the
+    vehicle is reliably still in frame but at a different bbox position.
+  - **Sub-stream HQ crops are capped.**  Even the largest non-edge crop
+    rarely exceeds ~300×200 px, so plates from `_hq.jpg` are usually
+    unreadable.  Use `_main_*.jpg` for any pixel-level analysis.
+  - **Color voting is intentionally conservative.**  `vote_color()`
+    returns "unknown" when the inner bbox has fewer than
+    `_COLOR_MIN_INNER_PIXELS=2000` pixels.  Rerunning with a stronger
+    model (CNN classifier on `_main_*.jpg`) is the obvious upgrade.
+  - **Track IDs reset per session.**  No cross-session re-id.  If you
+    aggregate across sessions, key on `(session_label, track_id)` or
+    `time_start_unix + class_name` rather than `track_id` alone.
+  - **IR periods are real gaps.**  During night, inference is fully
+    skipped (`ir_mode_active=True`).  `ir_periods` in meta lets you
+    distinguish "no traffic this hour" from "we were asleep".
+
+### Existing post-processing patterns to follow
+
+  - **`scripts/recolor_session.py`** -- the template for "open a closed
+    session dir, re-run a per-record computation, rewrite JSONL +
+    `_data.json` + `_hourly.json` + the embedded JSON in
+    `_summary.html`."  Standalone (does **not** import `nano_tracker`
+    or anything TRT/pycuda-related), so it runs on the dev box without
+    Nano deps.  Mirror this shape for new analysers.
+  - **`scripts/debug_color.py`** -- example of an interactive
+    per-image inspector, useful when tuning a heuristic against
+    a handful of cherry-picked crops.
+
+Dev-box runs Python 3.10+ and can use the full ML stack
+(`ultralytics`, `torch`, `torchvision`, `onnx`) -- these are declared
+under `pyproject.toml [project.optional-dependencies] export` and
+installed with `pip install -e .[export]`.  `opencv-python` is not in
+the project deps (since the Nano uses the system OpenCV instead) but is
+fine to install on the dev box for analysis work.  Do **not** add ML
+deps to the Nano-side `requirements.txt`; they won't install on
+Python 3.6 / JetPack 4.6.1 anyway.

@@ -35,6 +35,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Tuple
@@ -98,17 +99,23 @@ class TrackPoint(NamedTuple):
 
 _CROP_BUFFER_MAX = 12   # halve to ~6 when exceeded; bounds per-track memory
 _CROP_PAD_FRAC = 0.2    # pad bbox by 20% per side -- context for ALPR / OCR
+_HQ_EDGE_MARGIN_PX = 4  # bbox within N px of frame edge -> partially clipped
+_HQ_AREA_KEEP_FRAC = 0.7  # only re-score sharpness if area >= this * current best
+_HQ_SHARPNESS_TARGET_PX = 128  # downsample crop to this max side for cheap Laplacian
 
 
 class CropSample(NamedTuple):
     t: float            # seconds since session start
     score: float        # YOLO detection confidence (used to pick color reference)
     crop: np.ndarray    # padded BGR crop
+    on_edge: bool       # bbox touched the frame boundary (partially out of view)
 
 
 class Track(object):
     """Mutable per-vehicle state."""
-    __slots__ = ("id", "class_id", "points", "misses", "crops", "finalized")
+    __slots__ = ("id", "class_id", "points", "misses", "crops", "finalized",
+                 "hq_best_crop", "hq_best_score", "hq_best_area",
+                 "snap_count", "snap_saved_indexes", "last_snap_area")
 
     def __init__(self, track_id, class_id):
         self.id = track_id
@@ -117,11 +124,33 @@ class Track(object):
         self.misses = 0
         # Padded crop samples spread across the track lifetime.  Capped at
         # _CROP_BUFFER_MAX; on overflow we halve via [::2] so survivors still
-        # bracket the full duration.  Used at finalize-time to pick the
-        # mid-journey thumbnail, the highest-confidence HQ image (for ALPR),
-        # and color-vote samples.
+        # bracket the full duration.  Used for the mid-journey thumbnail and
+        # color voting.  HQ selection uses `hq_best_crop` instead so that the
+        # peak frame is never lost to buffer halving.
         self.crops = []           # type: List[CropSample]
         self.finalized = False
+        # Best HQ candidate seen so far on this track, scored by
+        # area * sharpness and restricted to non-edge crops.  Updated per
+        # detection (see _update_hq_best) so the actual peak frame is preserved
+        # regardless of buffer halving.
+        self.hq_best_crop = None     # type: Optional[np.ndarray]
+        self.hq_best_score = 0.0     # area * variance_of_laplacian
+        self.hq_best_area = 0        # cached area to short-circuit cheap re-checks
+        # Main-stream HTTP snapshot state (Reolink /cgi-bin/api.cgi?cmd=Snap).
+        # Up to `max_snaps_per_track` JPEGs are saved per track, each fire
+        # triggered when bbox area first crosses a threshold and re-fires on
+        # subsequent area growth (vehicle getting closer).  Each fire writes
+        # a distinct file `<prefix>_<id>_main_<N>.jpg` so post-processing has
+        # multiple chances to recover plate / color / model:
+        #   snap_count         -- N of last fire we *attempted* (1..max);
+        #                         doubles as the dashboard 4K-badge gate.
+        #   snap_saved_indexes -- N values the worker thread confirmed to disk
+        #                         (list.append is GIL-atomic).
+        #   last_snap_area     -- bbox area at the last fire, so re-fires only
+        #                         trigger on meaningful zoom-in.
+        self.snap_count = 0
+        self.snap_saved_indexes = []   # type: List[int]
+        self.last_snap_area = 0.0
 
 
 # ----------------------------------------------------------------------
@@ -234,11 +263,19 @@ class IoUTracker(object):
         cy = (d.y1 + d.y2) / 2.0
         tr.points.append(TrackPoint(frame, t, cx, cy, d.x1, d.y1, d.x2, d.y2, d.score))
         h, w = raw_frame.shape[:2]
+        # Edge-touch check on the *unpadded* detector bbox.  A vehicle entering
+        # or exiting the frame has its bbox clamped against the boundary, so
+        # the crop shows only half a car -- bad HQ candidate even if it scores
+        # large.  Margin is generous enough to also catch bboxes the detector
+        # extends slightly past the frame.
+        on_edge = (d.x1 < _HQ_EDGE_MARGIN_PX or d.y1 < _HQ_EDGE_MARGIN_PX
+                   or d.x2 > w - _HQ_EDGE_MARGIN_PX or d.y2 > h - _HQ_EDGE_MARGIN_PX)
         crop = _safe_crop(raw_frame, d, w, h, pad_frac=_CROP_PAD_FRAC)
         if crop is not None:
-            tr.crops.append(CropSample(t, d.score, crop))
+            tr.crops.append(CropSample(t, d.score, crop, on_edge))
             if len(tr.crops) > _CROP_BUFFER_MAX:
                 tr.crops = tr.crops[::2]
+            _update_hq_best(tr, crop, on_edge)
 
 
 # ----------------------------------------------------------------------
@@ -282,6 +319,47 @@ def _safe_crop(frame, d, w, h, pad_frac=0.0):
     if x2 <= x1 or y2 <= y1:
         return None
     return frame[y1:y2, x1:x2].copy()
+
+
+def _sharpness_score(crop):
+    # type: (np.ndarray) -> float
+    """Variance of Laplacian -- higher = sharper.  Downsampled to ~128px max
+    side so the Laplacian is sub-millisecond on the Nano even for large crops;
+    relative sharpness ranking is preserved by the downsample."""
+    import cv2  # type: ignore
+    h, w = crop.shape[:2]
+    longest = max(h, w)
+    if longest > _HQ_SHARPNESS_TARGET_PX:
+        scale = _HQ_SHARPNESS_TARGET_PX / float(longest)
+        small = cv2.resize(crop, (max(1, int(w * scale)), max(1, int(h * scale))),
+                           interpolation=cv2.INTER_AREA)
+    else:
+        small = crop
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def _update_hq_best(tr, crop, on_edge):
+    # type: (Track, np.ndarray, bool) -> None
+    """Refresh the per-track HQ best slot.  Independent of `tr.crops` so the
+    actual peak frame is never dropped by buffer halving.
+
+    Score = area * sharpness, restricted to non-edge crops.  Sharpness is only
+    computed when the crop has at least _HQ_AREA_KEEP_FRAC of the current best
+    area, since area dominates and a much smaller frame can't win even if it's
+    perfectly crisp.  This keeps the per-detection cost in the ~0-0.3 ms range
+    on Nano: most frames after the peak skip the Laplacian entirely."""
+    if on_edge:
+        return
+    area = crop.shape[0] * crop.shape[1]
+    if tr.hq_best_crop is not None and area < _HQ_AREA_KEEP_FRAC * tr.hq_best_area:
+        return  # can't beat the current best on area alone; skip the Laplacian
+    sharp = _sharpness_score(crop)
+    score = area * sharp
+    if tr.hq_best_crop is None or score > tr.hq_best_score:
+        tr.hq_best_crop = crop
+        tr.hq_best_score = score
+        tr.hq_best_area = area
 
 
 # ----------------------------------------------------------------------
@@ -460,6 +538,133 @@ def save_thumbnail(crop, path, quality=85):
         return False
 
 
+class ReolinkSnapshotter(object):
+    """Background fetcher for Reolink's main-stream HTTP snapshot.
+
+    The /cgi-bin/api.cgi?cmd=Snap endpoint returns a JPEG of the main stream
+    (typically 4K on RLC-1224A) regardless of which RTSP stream the tracker is
+    decoding.  This lets us pair the 896x512 sub-stream inference output with
+    full-resolution stills for ALPR / inspection -- the sub-stream HQ crop is
+    inherently capped at ~250x180.
+
+    Fetches run on daemon threads so the main inference loop never blocks on
+    HTTP.  A semaphore caps concurrency (default 2) to avoid hammering the
+    camera under heavy traffic.  Per-track dedup is the caller's job: pass
+    `fire_once_key` to ignore subsequent fires for that key.
+    """
+
+    def __init__(self, ip, port, user, password, timeout_s=5.0, max_concurrent=2):
+        # type: (str, int, str, str, float, int) -> None
+        import urllib.parse
+        self.url = "http://{}:{}/cgi-bin/api.cgi?cmd=Snap&channel=0&user={}&password={}".format(
+            ip, port,
+            urllib.parse.quote(user, safe=""),
+            urllib.parse.quote(password, safe=""),
+        )
+        self.timeout_s = timeout_s
+        self._sem = threading.Semaphore(max_concurrent)
+        self._lock = threading.Lock()
+        self.attempts = 0
+        self.successes = 0
+        self.failures = 0
+        self.dropped = 0
+
+    def fetch_async(self, output_path, on_done=None):
+        # type: (Path, Optional[callable]) -> None
+        """Spawn a daemon thread to fetch the snapshot.  `on_done(success)`
+        runs from the worker thread on completion (success OR failure)."""
+        t = threading.Thread(
+            target=self._fetch_to_disk, args=(output_path, on_done),
+            name="snap-{}".format(output_path.name), daemon=True,
+        )
+        t.start()
+
+    def _fetch_to_disk(self, output_path, on_done):
+        # type: (Path, Optional[callable]) -> None
+        import urllib.request
+        if not self._sem.acquire(blocking=False):
+            # Too many fetches in flight -- drop rather than queue, since the
+            # vehicle has already moved on by the time a queued snap would fire.
+            with self._lock:
+                self.dropped += 1
+            print("[snap] dropped {} (max concurrent fetches in flight)".format(output_path.name))
+            if on_done:
+                on_done(False)
+            return
+        try:
+            with self._lock:
+                self.attempts += 1
+            req = urllib.request.Request(self.url)
+            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+                data = resp.read()
+            # Sanity-check the response: Reolink returns JPEG on success but
+            # an HTML/JSON error page on auth failure or busy-camera state.
+            if len(data) < 100 or data[:3] != b"\xff\xd8\xff":
+                raise ValueError(
+                    "response is not a JPEG (len={}, head={!r})".format(len(data), data[:16])
+                )
+            output_path.write_bytes(data)
+            with self._lock:
+                self.successes += 1
+            if on_done:
+                on_done(True)
+        except Exception as exc:
+            with self._lock:
+                self.failures += 1
+            print("[snap] failed for {}: {}: {}".format(output_path.name, type(exc).__name__, exc))
+            if on_done:
+                on_done(False)
+        finally:
+            self._sem.release()
+
+
+def _cleanup_old_snaps(parent_dir, days):
+    # type: (Path, int) -> int
+    """Delete any `*_main_*.jpg` under `parent_dir/<session>/` whose mtime is
+    older than `days`.  Returns the number of files deleted.  Best-effort:
+    permission / race errors are swallowed per-file so one bad path doesn't
+    abort the whole sweep.  Cheap (stat-only) -- a 24h session-dir tree has
+    O(thousands) files, well under a second."""
+    if days <= 0:
+        return 0
+    cutoff = time.time() - days * 86400.0
+    n_deleted = 0
+    try:
+        for snap_path in parent_dir.glob("*/*_main_*.jpg"):
+            try:
+                if snap_path.stat().st_mtime < cutoff:
+                    snap_path.unlink()
+                    n_deleted += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return n_deleted
+
+
+def _class_asset_prefix(class_id):
+    # type: (int) -> str
+    """Filename prefix used for all per-track assets (thumb, HQ, main snaps).
+    Pedestrians get "person_", everything else gets "vehicle_" -- consistent
+    with the dashboard's two-tab split."""
+    return "person" if CLASS_NAMES.get(class_id, "") == "person" else "vehicle"
+
+
+def _fire_snapshot(snapshotter, tr, output_dir, n):
+    # type: (ReolinkSnapshotter, Track, Path, int) -> None
+    """Trigger the Nth main-stream snapshot for `tr`.  On success the worker
+    thread appends `n` to `tr.snap_saved_indexes` (list.append is GIL-atomic),
+    so the finalize-time read sees only the snaps actually on disk.  Bound
+    here (not on Track) so the callback closes over `tr` without us having
+    to teach the snapshotter about track objects."""
+    prefix = _class_asset_prefix(tr.class_id)
+    path = output_dir / "{}_{}_main_{}.jpg".format(prefix, tr.id, n)
+    def _done(ok):
+        if ok:
+            tr.snap_saved_indexes.append(n)
+    snapshotter.fetch_async(path, on_done=_done)
+
+
 def generate_html(attrs_list, output_dir, html_path, session_label, meta, refresh_seconds=15):
     # type: (List[dict], Path, Path, str, dict, int) -> None
     """Render the session dashboard.
@@ -467,23 +672,28 @@ def generate_html(attrs_list, output_dir, html_path, session_label, meta, refres
     Always uses a virtualized renderer (server-emits JSON; browser renders
     only the visible window).  This handles small sessions and 24h+ sessions
     with thousands of rows equally well -- the DOM never grows past the
-    visible viewport's worth of rows."""
+    visible viewport's worth of rows.
+
+    The page never reloads itself.  Instead it polls `vehicles.json` every
+    `refresh_seconds` and re-renders rows in place, preserving sort state and
+    scroll position.  `refresh_seconds=0` disables polling entirely.
+    """
     import html as html_mod
 
     class_counts = {}  # type: Dict[str, int]
     for v in attrs_list:
         class_counts[v["class_name"]] = class_counts.get(v["class_name"], 0) + 1
     parts = ["{} {}{}".format(c, n, "s" if c != 1 else "") for n, c in sorted(class_counts.items())]
-    summary_text = "{} vehicle{}: {}".format(
-        len(attrs_list), "s" if len(attrs_list) != 1 else "", ", ".join(parts)
-    ) if attrs_list else "No vehicles detected"
+    summary_text = "{} entr{}: {}".format(
+        len(attrs_list), "ies" if len(attrs_list) != 1 else "y", ", ".join(parts)
+    ) if attrs_list else "No detections yet"
 
     meta_kv = " · ".join("{}: {}".format(k, v) for k, v in sorted(meta.items()))
-    refresh_tag = '<meta http-equiv="refresh" content="{}">'.format(int(refresh_seconds)) if refresh_seconds > 0 else ''
 
-    # Serialize vehicle data to embed in the page.  Keep only the fields the
-    # row renderer needs to minimise page size.
-    data_json = json.dumps([
+    # Build the row payload that the page renders.  Embedded inline for the
+    # first paint, AND written to vehicles.json next to the HTML so the page's
+    # poll loop can fetch fresh data without a full page reload.
+    rows_payload = [
         {
             "track_id": v["track_id"],
             "class_name": v["class_name"],
@@ -495,15 +705,21 @@ def generate_html(attrs_list, output_dir, html_path, session_label, meta, refres
             "speed_px_s": v["speed_px_s"],
             "lane": v["lane"],
             "avg_confidence": v["avg_confidence"],
+            "asset_prefix": v.get("asset_prefix", "vehicle"),
+            "main_snaps": list(v.get("main_snaps", [])),
         }
         for v in attrs_list
-    ], separators=(",", ":"))
+    ]
+    data_json = json.dumps(rows_payload, separators=(",", ":"))
+    # Sibling JSON for the in-page poller.  Always overwritten; small enough
+    # (~150 bytes per row) that even a 10k-row 24h session is ~1.5 MB.
+    (output_dir / "vehicles.json").write_text(data_json, encoding="utf-8")
 
     # Pre-format styles + script using string concatenation (NOT .format) to
     # avoid CSS/JS brace collisions with .format() placeholders.
+    poll_ms = int(max(refresh_seconds, 0)) * 1000  # 0 disables polling
     page = (
         '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
-        + refresh_tag
         + '<title>NanoTracker -- ' + html_mod.escape(session_label) + '</title>'
         + '<style>'
         + '*{margin:0;padding:0;box-sizing:border-box}'
@@ -524,10 +740,23 @@ def generate_html(attrs_list, output_dir, html_path, session_label, meta, refres
         + '.row:hover{background:#252525}'
         + '.row img{max-width:80px;max-height:54px;border-radius:4px;display:block}'
         + '.no-img{width:80px;height:54px;background:#333;border-radius:4px;display:flex;align-items:center;justify-content:center;color:#666;font-size:0.7rem}'
+        + '.thumb-cell{display:flex;flex-direction:column;align-items:flex-start;gap:3px;width:80px}'
+        + '.thumb-cell>a:first-child{display:block;line-height:0}'
+        + '.snap-row{display:flex;flex-wrap:wrap;gap:3px;min-height:14px}'
+        + '.snap-badge{display:inline-block;background:#0a84ff;color:#fff;font-size:0.6rem;font-weight:700;padding:1px 5px;border-radius:3px;text-decoration:none;line-height:1.3;min-width:12px;text-align:center}'
+        + '.snap-badge:hover{background:#1f95ff}'
+        + '.snap-badge.label{background:transparent;color:#888;padding:1px 0;font-weight:400}'
+        + '.tabs{display:flex;gap:4px;margin-bottom:0;border-bottom:1px solid #333}'
+        + '.tab{padding:8px 16px;background:#252525;color:#aaa;border:1px solid #333;border-bottom:none;border-radius:4px 4px 0 0;cursor:pointer;font-size:0.85rem;user-select:none;font-weight:600}'
+        + '.tab:hover{color:#fff}'
+        + '.tab.active{background:#1a1a1a;color:#e0e0e0;border-color:#444;position:relative;top:1px}'
+        + '.tab .ct{color:#666;font-weight:400;margin-left:6px;font-size:0.8rem}'
+        + '.tab.active .ct{color:#888}'
         + '</style></head><body>'
         + '<h1>NanoTracker Summary</h1>'
-        + '<div class="summary">Session: ' + html_mod.escape(session_label) + ' &mdash; ' + html_mod.escape(summary_text) + '</div>'
+        + '<div class="summary">Session: ' + html_mod.escape(session_label) + ' &mdash; <span id="summary-text">' + html_mod.escape(summary_text) + '</span></div>'
         + '<div class="meta">' + html_mod.escape(meta_kv) + '</div>'
+        + '<div class="tabs" id="tabs"></div>'
         + '<div class="vp" id="vp">'
         + '  <div class="thead">'
         + '    <span>Thumbnail</span>'
@@ -545,19 +774,34 @@ def generate_html(attrs_list, output_dir, html_path, session_label, meta, refres
         + '</div>'
         + '<script id="vehicles-data" type="application/json">' + data_json + '</script>'
         + '<script>'
-        + 'const DATA=JSON.parse(document.getElementById("vehicles-data").textContent);'
-        + 'const ROW_H=72;'
+        + 'let DATA=JSON.parse(document.getElementById("vehicles-data").textContent);'
+        + 'const POLL_MS=' + str(poll_ms) + ';'
+        + 'const ROW_H=88;'
+        + 'const TABS=[{label:"Cars",cls:"car"},{label:"People",cls:"person"}];'
+        + 'function readTabHash(){const m=location.hash.match(/tab=([^&]+)/);return m?decodeURIComponent(m[1]):null}'
+        + 'let activeTab=readTabHash()||TABS[0].cls;'
         + 'let sortKey="time_start_unix",sortAsc=false;'
-        + 'let sorted=DATA.slice();'
-        + 'const VP=document.getElementById("vp"),SPACER=document.getElementById("spacer"),ROWS=document.getElementById("rows");'
+        + 'let sorted=[];'
+        + 'const VP=document.getElementById("vp"),SPACER=document.getElementById("spacer"),ROWS=document.getElementById("rows"),TABBAR=document.getElementById("tabs");'
         + 'function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",\'"\':"&quot;"}[c]))}'
         + 'function sortData(){sorted.sort((a,b)=>{let va=a[sortKey],vb=b[sortKey];if(typeof va==="number")return sortAsc?va-vb:vb-va;va=String(va);vb=String(vb);return sortAsc?va.localeCompare(vb):vb.localeCompare(va)})}'
         + 'function rowHtml(v,i){'
         +   'const t=(v.time_start||"").substr(11,8);'
-        +   'const thumb="vehicle_"+v.track_id+".jpg";'
-        +   'const hq="vehicle_"+v.track_id+"_hq.jpg";'
+        +   'const pfx=v.asset_prefix||"vehicle";'
+        +   'const thumb=pfx+"_"+v.track_id+".jpg";'
+        +   'const hq=pfx+"_"+v.track_id+"_hq.jpg";'
+        +   'const snaps=v.main_snaps||[];'
+        # Snap row: one labelled "4K" prefix (non-clickable hint) followed
+        # by one clickable numeric badge per saved main-stream snapshot.
+        # Latest snap is the rightmost; click any to open its JPEG.
+        +   'const snapBadges=snaps.length>0'
+        +     '?`<span class="snap-badge label">4K</span>`+snaps.map(n=>`<a class="snap-badge" href="${pfx}_${v.track_id}_main_${n}.jpg" target="_blank" title="main-stream snapshot ${n} of ${snaps.length}">${n}</a>`).join("")'
+        +     ':"";'
         +   'return `<div class="row" style="top:${i*ROW_H}px">'
-        +     '<a href="${hq}" target="_blank" title="open full-quality crop"><img src="${thumb}" loading="lazy"></a>'
+        +     '<span class="thumb-cell">'
+        +       '<a href="${hq}" target="_blank" title="open full-quality crop"><img src="${thumb}" loading="lazy"></a>'
+        +       '<span class="snap-row">${snapBadges}</span>'
+        +     '</span>'
         +     '<span>#${v.track_id}</span>'
         +     '<span>${esc(v.class_name)}</span>'
         +     '<span>${esc(v.color)}</span>'
@@ -588,7 +832,55 @@ def generate_html(attrs_list, output_dir, html_path, session_label, meta, refres
         + '});'
         + 'VP.addEventListener("scroll",render);'
         + 'window.addEventListener("resize",render);'
-        + 'sortData();render();'
+        + 'function updateSummary(){'
+        +   'const counts={};'
+        +   'DATA.forEach(v=>{counts[v.class_name]=(counts[v.class_name]||0)+1});'
+        +   'const parts=Object.keys(counts).sort().map(n=>{const c=counts[n];return c+" "+n+(c!==1?"s":"")});'
+        +   'const n=DATA.length;'
+        +   'const txt=n>0?(n+" detection"+(n!==1?"s":"")+": "+parts.join(", ")):"No detections yet";'
+        +   'const el=document.getElementById("summary-text");if(el)el.textContent=txt;'
+        + '}'
+        + 'function renderTabs(){'
+        +   'const counts={};'
+        +   'DATA.forEach(v=>{counts[v.class_name]=(counts[v.class_name]||0)+1});'
+        +   'TABBAR.innerHTML=TABS.map(t=>{'
+        +     'const c=counts[t.cls]||0;'
+        +     'const cls="tab"+(t.cls===activeTab?" active":"");'
+        +     'return `<span class="${cls}" data-cls="${t.cls}">${t.label}<span class="ct">${c}</span></span>`;'
+        +   '}).join("");'
+        +   'TABBAR.querySelectorAll(".tab").forEach(el=>{'
+        +     'el.addEventListener("click",()=>setTab(el.dataset.cls));'
+        +   '});'
+        + '}'
+        + 'function setTab(cls){'
+        +   'if(cls===activeTab)return;'
+        +   'activeTab=cls;'
+        +   'history.replaceState(null,"","#tab="+encodeURIComponent(cls));'
+        +   'renderTabs();'
+        +   'applyFilterSortRender(true);'
+        + '}'
+        + 'function applyFilterSortRender(resetScroll){'
+        +   'sorted=DATA.filter(v=>v.class_name===activeTab);'
+        +   'sortData();'
+        +   'if(resetScroll)VP.scrollTop=0;'
+        +   'render();'
+        + '}'
+        + 'renderTabs();applyFilterSortRender(false);updateSummary();'
+        # Live refresh: fetch vehicles.json, replace DATA, re-sort + re-filter
+        # under the user's current tab + sort, re-render.  Never reloads the
+        # page, so scroll position, sort indicators, and active tab survive.
+        # Cache-buster on the URL since SimpleHTTPRequestHandler 304s.
+        + 'if(POLL_MS>0){'
+        +   'setInterval(()=>{'
+        +     'fetch("vehicles.json?t="+Date.now()).then(r=>r.ok?r.json():null).then(d=>{'
+        +       'if(!d)return;'
+        +       'DATA=d;renderTabs();applyFilterSortRender(false);updateSummary();'
+        +     '}).catch(()=>{});'
+        +   '},POLL_MS);'
+        + '}'
+        + 'window.addEventListener("hashchange",()=>{'
+        +   'const t=readTabHash();if(t&&t!==activeTab){activeTab=t;renderTabs();applyFilterSortRender(true);}'
+        + '});'
         + '</script>'
         + '</body></html>'
     )
@@ -786,6 +1078,37 @@ def run(args):
         safe_url = rtsp_url.replace(cfg["camera"].get("password") or "", "***") if cfg["camera"].get("password") else rtsp_url
         print("[main] RTSP: {}  codec={}".format(safe_url, codec))
 
+    # Main-stream snapshot fetcher (RTSP only; file inputs have no camera).
+    # When a tracked vehicle's bbox first crosses `area_threshold_frac` of the
+    # sub-stream frame area, fire an async HTTP snapshot against the main
+    # stream (typically 4K) for high-resolution inspection / ALPR.
+    snap_cfg = cfg.get("snapshot", {})
+    snap_enabled = bool(snap_cfg.get("enabled", True)) and not args.video
+    snap_area_threshold = float(snap_cfg.get("area_threshold_frac", 0.05))
+    snap_growth_factor = float(snap_cfg.get("refire_growth_factor", 1.5))
+    snap_max_per_track = int(snap_cfg.get("max_snaps_per_track", 3))
+    snap_keep_days = int(snap_cfg.get("keep_days", 7))
+    snap_cleanup_interval_s = float(snap_cfg.get("cleanup_interval_s", 3600.0))
+    snapshotter = None  # type: Optional[ReolinkSnapshotter]
+    if snap_enabled:
+        cam = cfg["camera"]
+        snap_password = args.password or os.environ.get("REOLINK_PASSWORD") or cam.get("password") or ""
+        snapshotter = ReolinkSnapshotter(
+            ip=cam["ip"],
+            port=int(cfg.get("ports", {}).get("http", 80)),
+            user=cam.get("username", "admin"),
+            password=snap_password,
+            timeout_s=float(snap_cfg.get("timeout_s", 5.0)),
+            max_concurrent=int(snap_cfg.get("max_concurrent", 2)),
+        )
+        print("[main] Snapshot:    main-stream HTTP @ area_frac>={:.2f}, refire on {:.1f}x growth, max {} per track".format(
+            snap_area_threshold, snap_growth_factor, snap_max_per_track,
+        ))
+        if snap_keep_days > 0:
+            print("[main] Snap cleanup: deleting *_main_*.jpg older than {} days (every {:.0f}s)".format(
+                snap_keep_days, snap_cleanup_interval_s,
+            ))
+
     # Output dir
     session_label = "{}_{}".format(
         out_cfg.get("session_label_prefix", "session"),
@@ -907,6 +1230,7 @@ def run(args):
     html_writes = 0
     last_log = t_start
     last_heartbeat = 0.0
+    last_cleanup = t_start  # snap-retention sweep timestamp
     heartbeat_path = output_dir / ".heartbeat"
 
     # Reconnect state (RTSP only): wall-clock-based session_t makes per-conn
@@ -954,36 +1278,45 @@ def run(args):
         """Compute attrs for a finalized track, persist, and update HTML state."""
         nonlocal raw_track_count, last_finalize_time, html_dirty
         raw_track_count += 1
-        # Largest-bbox crop = most pixels on the vehicle.  Used both as the
-        # HQ click-through image AND as the input to color voting (more
-        # pixels => more reliable vote).  Previously HQ was a higher-quality
-        # encode of the mid-journey crop -- but for far-lane tracks the
-        # mid-journey crop is tiny and the HQ was just a marginally bigger
-        # JPEG of the same tiny image; user couldn't read plates from it.
-        # Picking the largest-bbox frame gives a meaningfully larger image
-        # for tracks where the car had a close pass.
-        best_crop = None  # type: Optional[np.ndarray]
+        # HQ crop is the per-track best slot updated every detection (area *
+        # sharpness, non-edge only), so the peak frame is never lost to the
+        # rolling buffer's [::2] halving.  Color voting prefers a non-edge
+        # buffered crop (largest first); the buffer is a small biased sample
+        # and the HQ best may itself not be in it, but voting wants *some*
+        # large clean sample regardless of sharpness.
         color = "unknown"
         if tr.crops:
-            best = max(tr.crops, key=lambda c: c.crop.shape[0] * c.crop.shape[1])
-            best_crop = best.crop
-            color = vote_color(best_crop)
+            non_edge = [c for c in tr.crops if not c.on_edge] or tr.crops
+            best_color_crop = max(non_edge, key=lambda c: c.crop.shape[0] * c.crop.shape[1]).crop
+            color = vote_color(best_color_crop)
         attrs = compute_attributes(tr, frame_h or 1080, min_duration, parked_disp, color, t_start_wall)
         if attrs is None:
             return  # filtered: too short, or parked
+        # Asset filename prefix tracks the class so the dashboard can render
+        # `person_<id>_main_<N>.jpg` vs `vehicle_<id>_main_<N>.jpg` cleanly.
+        prefix = _class_asset_prefix(tr.class_id)
+        attrs["asset_prefix"] = prefix
+        # List of N values for main-stream snapshots actually on disk.  Worker
+        # threads append to this list as fetches complete; the copy here is a
+        # snapshot at finalize-time -- any fetch still in flight is missed.
+        attrs["main_snaps"] = sorted(list(tr.snap_saved_indexes))
         if save_thumbs and tr.crops:
-            # Two crops per vehicle:
-            #   vehicle_<id>.jpg     mid-journey crop @ q=85 -- dashboard tile;
-            #                        mid-journey tends to have the best plate
-            #                        angle (car square-on, not broadside).
-            #   vehicle_<id>_hq.jpg  largest-bbox crop @ q=95 -- click-through
-            #                        full-resolution; most pixels on vehicle
-            #                        for inspection / ALPR / future re-color.
+            # Per-track assets (class prefix is "vehicle" for cars / unknowns
+            # and "person" for pedestrians):
+            #   <prefix>_<id>.jpg          mid-journey crop @ q=85 -- dashboard
+            #                              tile; mid-journey tends to have the
+            #                              best plate angle (square-on view).
+            #   <prefix>_<id>_hq.jpg       sub-stream HQ crop @ q=95 -- best-of-
+            #                              track on area * sharpness, non-edge.
+            #   <prefix>_<id>_main_<N>.jpg 4K main-stream snapshots, up to
+            #                              `max_snaps_per_track` per track,
+            #                              spaced by 1.5x area growth (approach
+            #                              / peak / departure of the close pass).
             midpoint_t = (tr.points[0].t + tr.points[-1].t) / 2.0
             mid = min(tr.crops, key=lambda c: abs(c.t - midpoint_t)).crop
-            save_thumbnail(mid, output_dir / "vehicle_{}.jpg".format(tr.id))
-            if best_crop is not None:
-                save_thumbnail(best_crop, output_dir / "vehicle_{}_hq.jpg".format(tr.id), quality=95)
+            save_thumbnail(mid, output_dir / "{}_{}.jpg".format(prefix, tr.id))
+            if tr.hq_best_crop is not None:
+                save_thumbnail(tr.hq_best_crop, output_dir / "{}_{}_hq.jpg".format(prefix, tr.id), quality=95)
         event_log.append(attrs)
         attrs_list.append(attrs)
         last_finalize_time = time.monotonic()
@@ -1002,7 +1335,7 @@ def run(args):
         status log.  Mutates loop-state through nonlocal closure vars."""
         nonlocal frame_idx, frames_inferred, frame_h
         nonlocal ir_mode, ir_period_start_wall, last_finalize_time
-        nonlocal html_dirty, last_log, last_heartbeat
+        nonlocal html_dirty, last_log, last_heartbeat, last_cleanup
 
         frame_idx += 1
         if frame_h == 0:
@@ -1052,6 +1385,31 @@ def run(args):
             expired = tracker.update(dets, frame_idx, session_t, frame)
             for tr in expired:
                 finalize(tr)
+            # Main-stream snapshot triggers: fire when the bbox crosses
+            # `area_threshold_frac` of frame area, AND re-fire whenever the
+            # area subsequently grows by `refire_growth_factor` (default 1.5x)
+            # vs the area at the last fire.  Capped at `max_snaps_per_track`
+            # fires per track; the N-th fire is saved as
+            # <prefix>_<id>_main_<N>.jpg so post-processing has multiple
+            # chances to recover plate / color / model.  Done after `update()`
+            # so brand-new tracks entering large already get a shot.  Async.
+            if snapshotter is not None:
+                fh_now, fw_now = frame.shape[0], frame.shape[1]
+                frame_area = float(fh_now * fw_now)
+                if frame_area > 0:
+                    for tr in tracker._active.values():
+                        if not tr.points or tr.snap_count >= snap_max_per_track:
+                            continue
+                        p = tr.points[-1]
+                        bbox_area = (p.x2 - p.x1) * (p.y2 - p.y1)
+                        if bbox_area / frame_area < snap_area_threshold:
+                            continue
+                        # First-fire or re-fire on substantial growth.
+                        if tr.last_snap_area > 0 and bbox_area < tr.last_snap_area * snap_growth_factor:
+                            continue
+                        tr.snap_count += 1
+                        tr.last_snap_area = bbox_area
+                        _fire_snapshot(snapshotter, tr, output_dir, tr.snap_count)
         else:
             dets = []
 
@@ -1075,6 +1433,17 @@ def run(args):
             except OSError as exc:
                 print("[heartbeat] write failed: {}".format(exc))
             last_heartbeat = now
+
+        # Periodic main-stream snapshot cleanup.  Runs across the parent
+        # output directory (all sessions), not just this one -- the point is
+        # to bound total disk usage at high traffic, where stale snaps from
+        # earlier sessions accumulate.  Cheap stat-only walk; opt-in via
+        # snapshot.keep_days in config.
+        if snap_keep_days > 0 and now - last_cleanup >= snap_cleanup_interval_s:
+            n = _cleanup_old_snaps(output_dir.parent, snap_keep_days)
+            if n > 0:
+                print("[cleanup] deleted {} main snaps older than {} days".format(n, snap_keep_days))
+            last_cleanup = now
 
         log_every_s = 30.0 if ir_mode else 2.0
         if now - last_log >= log_every_s:

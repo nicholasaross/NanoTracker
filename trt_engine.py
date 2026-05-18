@@ -32,9 +32,14 @@ except ImportError as exc:  # pragma: no cover -- import guard for dev-box use
     ) from exc
 
 
-# YOLOv8 COCO class IDs we care about (matches VehicleTracker).
-VEHICLE_CLASSES = (2, 3, 5, 7)  # car, motorcycle, bus, truck
-CLASS_NAMES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
+# YOLOv8 COCO class IDs we care about.  Default filter is car-only (matches
+# the VehicleTracker default); the per-deployment filter lives in
+# inference.vehicle_classes in camera_config.json.  The name map covers every
+# class anyone is likely to enable here so the dashboard's Type column reads
+# correctly (person passes get labeled "person" instead of "unknown").
+VEHICLE_CLASSES = (2, 3, 5, 7)  # car, motorcycle, bus, truck (legacy default)
+CLASS_NAMES = {0: "person", 1: "bicycle", 2: "car", 3: "motorcycle",
+               5: "bus", 7: "truck", 15: "cat", 16: "dog"}
 
 
 class Detection(NamedTuple):
