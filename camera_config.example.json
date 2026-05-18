@@ -77,6 +77,8 @@
         "keep_days": 7,
         "cleanup_interval_s": 3600,
         "timeout_s": 5.0,
-        "max_concurrent": 2
+        "max_concurrent": 2,
+        "_min_sharpness_comment": "Blur gate (opt-in, 0 = disabled). Minimum variance-of-Laplacian on the sub-stream bbox crop (downsampled to 128px) required to fire a main-stream HTTP snap. Skipped fires do NOT consume a snap slot, so the track keeps re-checking until either the blur clears or its bbox area drops back below threshold. Typical values at 896x512 sub-stream: sharp daylight ~100-400+, slight blur ~30-80, heavy motion blur <20. Useful around dusk when the camera's auto-exposure drags out the shutter and moving vehicles smear. Start around 50 and tune from the [snap] track N blur skip log lines.",
+        "min_sharpness": 0.0
     }
 }
