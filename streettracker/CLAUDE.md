@@ -103,5 +103,44 @@ JSON record fields: see `common/schema.py` (`TrackRecord`).
 ## Migration status
 
 This repo is a clean-slate replacement for VehicleTracker + NanoTracker.
-Migration phases tracked in the project plan (`plans/`). Until cutover,
-both source repos remain authoritative for their current targets.
+Source-of-truth scaffolding is currently developed in NanoTracker's
+`claude/nano-orin-setup-plan-CCWUD` branch under `streettracker/` and
+mirrored here phase by phase via `cp -a`. See NanoTracker's `CLAUDE.md`
+"Active migration: StreetTracker" section for the recipe.
+
+| Phase | Scope | Status |
+|---|---|---|
+| 0 | repo init + pyproject + CI + configs | **done** |
+| 1 | `common/`: schema, color, output, hourly, summary | **done** |
+| 2 | `inference/` (Ultralytics runner) + `sources/` (RTSP, file) | **done** |
+| 4a | `analysis/`: recolor + debug-color | **done** |
+| 4b | `analysis/alpr/` wholesale port | pending |
+| 5 | CLI: `pull`, `export-engine`, `setup_orin.sh`, systemd | pending |
+| 3 | `device/`: live runtime, snapshotter, dashboard, IR | pending (Orin) |
+| 6 | (opt) original Nano archive role | not started |
+| 7 | cutover: archive both old repos | not started |
+
+Tests at HEAD: **76 passing, ruff clean.**
+
+Verify locally:
+
+```bash
+uv sync
+uv run pytest
+uv run ruff check src/ tests/
+```
+
+CLI smoke:
+
+```bash
+uv run streettracker --help
+uv run streettracker --version
+uv run streettracker recolor --help
+uv run streettracker debug-color --help
+```
+
+`run` / `batch` / `pull` / `export-engine` print
+"not yet implemented" until their phases land.
+
+Until cutover (phase 7), VehicleTracker + NanoTracker remain
+authoritative for their current targets.

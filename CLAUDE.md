@@ -2,6 +2,111 @@
 
 Guidance for Claude Code when working in this repository.
 
+## Active migration: StreetTracker (read this first)
+
+NanoTracker is being superseded by **`nicholasaross/StreetTracker`** — a
+unified Python-3.12 / Ultralytics / uv-managed repo that absorbs the right
+pieces of both VehicleTracker and NanoTracker for deployment on the new
+**Jetson Orin Nano 8GB Super** (JetPack 6.x now, 7.x imminent).
+VehicleTracker + NanoTracker will be archived after cutover.
+
+**Active migration branch (this one):** `claude/nano-orin-setup-plan-CCWUD`.
+**Scaffold subdir:** `streettracker/` in this repo, committed here for
+ephemeral-container durability. Each phase is a self-contained commit;
+the user extracts to the StreetTracker repo as phases land.
+
+### Phase status
+
+| Phase | Scope | Status | Commit |
+|---|---|---|---|
+| 0 | repo init: pyproject (uv, Py3.12, CUDA-12.6 torch), CI, configs | **done** | `36821db` |
+| 1 | `common/` layer: schema, color, output, hourly, summary | **done** | `36821db` |
+| 2 | `inference/` (Ultralytics runner) + `sources/` (RTSP, file) | **done** | `2f9dc6e` |
+| 4a | `analysis/`: recolor + debug-color | **done** | `72d95e9` |
+| 4b | `analysis/alpr/` wholesale port (~1.5k lines) | pending | — |
+| 5 | CLI: `pull`, `export-engine`, `setup_orin.sh`, systemd unit | pending | — |
+| 3 | `device/`: live runtime, snapshotter, dashboard, IR | pending (needs Orin) | — |
+| 6 | (optional) original Nano as offline archive / web host | not started | — |
+| 7 | cutover: archive NanoTracker + VehicleTracker | not started | — |
+
+Tests at HEAD: **76 passing, ruff clean.** Verify with:
+
+```bash
+cd streettracker && uv sync && uv run pytest
+# or, in this container: PYTHONPATH=streettracker/src python3 -m pytest streettracker/tests/ -q
+```
+
+### Sync the latest into the StreetTracker repo
+
+User runs this off-box after each phase commit:
+
+```bash
+cd /tmp/nt   # the existing NanoTracker clone
+git fetch origin
+git checkout claude/nano-orin-setup-plan-CCWUD
+git pull --ff-only
+
+cp -a streettracker/. /tmp/st/   # mirror subdir into StreetTracker clone
+
+cd /tmp/st
+git add -A
+git status                       # sanity check before commit
+git commit -m "Sync phase X from NanoTracker branch (<commit-sha>)"
+git push origin main
+```
+
+`cp -a` adds + overwrites but does NOT delete; safe even if the user has
+added their own files (LICENSE, etc.) to StreetTracker. If a future phase
+deletes a streettracker/ file, call that out in the commit message so the
+user can `git rm` it manually after the cp.
+
+### Resuming this work
+
+When opening this repo:
+
+1. Read this section first.
+2. Read `streettracker/CLAUDE.md` for the StreetTracker-side guidance
+   (architecture, hardware targets, output schema).
+3. Skim recent commit messages on `claude/nano-orin-setup-plan-CCWUD` —
+   each phase commit's body is the canonical change log for that phase.
+4. Confirm test state: `PYTHONPATH=streettracker/src python3 -m pytest streettracker/tests/ -q`.
+5. Continue with the next pending phase. Recommended order: **5 → 4b → 3**
+   (5 is small + finishable, 4b is mechanical, 3 needs Orin hardware to
+   verify and should land last).
+
+### Key design decisions (locked)
+
+- **Repo name:** `StreetTracker` (display / GitHub) + `streettracker`
+  (Python package, CLI command).
+- **Python 3.12** floor — matches VehicleTracker + JetPack 7 Ubuntu 24.04
+  system Python. On JetPack 6.x install via `uv python install 3.12`.
+- **Ultralytics' built-in TRT path** (`YOLO('best.engine').track(...)`)
+  replaces NanoTracker's hand-rolled `trt_engine.py` (manual decode +
+  numpy NMS) and bespoke `IoUTracker`. ~400 lines deleted.
+- **BotSORT** (from VehicleTracker's `botsort_custom.yaml`) for tracking.
+- **Single repo, single install** — no `[device]` / `[devbox]` extras
+  split. Orin 8GB Super has the headroom for the full torch + ultralytics
+  stack; the historic "device can't run torch" constraint is dead.
+- **`alpr` is an opt-in extra**, not base (easyocr pulls ~1 GB torch).
+- **Original Jetson Nano** is NOT in the active path. Documented as
+  optional offline archive / static-HTML host only.
+- **MCP allowlist constraint** (this session only): my GitHub MCP scope
+  is `nicholasaross/nanotracker` only, so I push only to NanoTracker;
+  the user re-extracts into StreetTracker. A future session that scopes
+  to StreetTracker can develop directly there.
+
+### MCP-allowlist-aware operating notes for future sessions
+
+If your scope includes `nicholasaross/streettracker`: develop in a fresh
+StreetTracker clone, skip the `streettracker/` subdir indirection. The
+`streettracker/` subdir in this repo can be deleted once cutover happens
+(phase 7).
+
+If your scope is still `nicholasaross/nanotracker` only: continue using
+the `streettracker/` subdir on this branch and the cp-mirror recipe.
+
+---
+
 ## Project overview
 
 NanoTracker is the Jetson Nano (original, JetPack 4.6.1) deployment of the
