@@ -1,0 +1,44 @@
+{
+    "_comment": [
+        "Reolink camera config for StreetTracker live RTSP mode.",
+        "Copy to camera_config.json (gitignored) and fill in the password.",
+        "Modes differ by Reolink model: many RLC-1224A units serve H.265",
+        "at /h264Preview_01_main (path does not reflect codec). Test both",
+        "streams once with ffprobe before committing to one."
+    ],
+    "camera": {
+        "ip": "192.168.1.72",
+        "rtsp_port": 554,
+        "http_port": 80,
+        "user": "admin",
+        "password": "REPLACE_ME"
+    },
+    "streams": [
+        {
+            "name": "sub",
+            "path": "/h264Preview_01_sub",
+            "codec": "h264",
+            "width": 896,
+            "height": 512
+        },
+        {
+            "name": "main",
+            "path": "/h264Preview_01_main",
+            "codec": "h265",
+            "width": 4096,
+            "height": 2784
+        }
+    ],
+    "use_stream": "sub",
+    "snapshot": {
+        "enabled": true,
+        "max_snaps_per_track": 3,
+        "min_bbox_area_frac": 0.05,
+        "growth_factor": 1.5,
+        "cleanup_older_than_days": 30
+    },
+    "dashboard": {
+        "host": "0.0.0.0",
+        "port": 8080
+    }
+}

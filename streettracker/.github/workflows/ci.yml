@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install dependencies (no torch / ultralytics on CI)
+        # CI runs only common-layer tests, which don't need torch or
+        # ultralytics. Skip the heavy ML stack to keep CI fast and avoid
+        # pulling 2GB+ of wheels. Device tests are gated by `-m device`.
+        run: |
+          uv pip install --system \
+            "numpy>=1.26,<3.0" \
+            "Pillow>=10" \
+            "jinja2>=3.1" \
+            "opencv-python-headless>=4.10" \
+            "pytest>=8" \
+            "ruff>=0.6"
+
+      - name: Lint
+        run: ruff check src/ tests/
+
+      - name: Test (common layer)
+        run: PYTHONPATH=src pytest -m "not device" -v tests/

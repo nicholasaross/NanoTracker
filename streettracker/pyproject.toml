@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "streettracker"
+version = "0.1.0"
+description = "Detect, track, and summarize vehicles and persons from video and live RTSP"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "Nicholas Aross" }]
+
+dependencies = [
+    "ultralytics>=8.4,<9.0",
+    "opencv-python>=4.10",
+    "torch>=2.10",
+    "torchvision>=0.25",
+    "lap>=0.5.12",
+    "numpy>=1.26,<3.0",
+    "Pillow>=10",
+    "jinja2>=3.1",
+    "requests>=2.32",
+]
+
+[project.optional-dependencies]
+alpr = [
+    "easyocr>=1.7,<2.0",
+    "fast-plate-ocr>=0.3",
+    "open-image-models>=0.2",
+    "onnxruntime-gpu>=1.18",
+]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+    "ruff>=0.6",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+streettracker = "streettracker.cli:main"
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu126", marker = "sys_platform != 'darwin'" }]
+torchvision = [{ index = "pytorch-cu126", marker = "sys_platform != 'darwin'" }]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/streettracker"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "C4"]
+
+[tool.ruff.lint.per-file-ignores]
+# summary.py is a port of NanoTracker's HTML generator: long JavaScript
+# strings are inherent to the inline-template approach. Migration to
+# Jinja2 is on the roadmap; until then, suppress line-length only here.
+"src/streettracker/common/summary.py" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "device: requires Jetson device with TensorRT + CUDA",
+]

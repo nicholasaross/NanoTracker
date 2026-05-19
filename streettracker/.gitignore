@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# uv
+.venv/
+uv.lock.bak
+
+# Build artifacts
+dist/
+build/
+
+# Project artifacts (Nano-side, never commit)
+*.engine
+*.onnx
+*.pt
+*.weights
+output/
+camera_config.json
+*.mp4
+*.mkv
+
+# Editor noise
+.vscode/
+.idea/
+*.swp
+.DS_Store

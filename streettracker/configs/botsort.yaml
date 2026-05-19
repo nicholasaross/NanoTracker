@@ -1,0 +1,20 @@
+# BotSORT tracker config for Ultralytics' built-in tracking.
+# Ported from VehicleTracker's botsort_custom.yaml. Lightly tuned for
+# fast-moving traffic at sub-stream resolution (~896x512); revisit on
+# Orin Nano main-stream (4K) runs.
+
+tracker_type: botsort
+
+# Track stability
+track_high_thresh: 0.5      # detections above this start new tracks
+track_low_thresh: 0.1       # detections above this extend existing tracks
+new_track_thresh: 0.6
+track_buffer: 30            # frames a track survives without detections
+match_thresh: 0.8
+
+# BotSORT-specific
+fuse_score: true
+gmc_method: sparseOptFlow   # camera motion compensation
+proximity_thresh: 0.5
+appearance_thresh: 0.25
+with_reid: false            # set true on Orin once a reid embedder is wired
