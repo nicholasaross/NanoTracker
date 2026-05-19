@@ -1,40 +1,76 @@
 """StreetTracker CLI entry point.
 
 Subcommands:
-- `streettracker run` — live RTSP (Orin only)
-- `streettracker batch <video>` — file input
-- `streettracker pull` — rsync session from device
-- `streettracker recolor <session>` — rerun color heuristic
-- `streettracker export-engine` — `.pt` → `.engine` via Ultralytics
+- ``streettracker run`` — live RTSP (Orin only)         [phase 3]
+- ``streettracker batch <video>`` — file input          [phase 5]
+- ``streettracker pull`` — rsync session from device    [phase 5]
+- ``streettracker recolor <session>`` — rerun color heuristic
+- ``streettracker debug-color <crop.jpg>`` — inspect a single crop
+- ``streettracker export-engine`` — ``.pt`` → ``.engine``  [phase 3]
+
+Each subcommand owns its own ``argparse.ArgumentParser`` in its module's
+``main()`` — we dispatch on the first positional rather than using
+``add_subparsers`` so subcommand parsers receive ``--help`` cleanly
+instead of having the top-level parser intercept it.
 """
 
 from __future__ import annotations
 
-import argparse
 import sys
+
+_HELP = """\
+usage: streettracker [--version] <command> [<args>]
+
+commands:
+  run             live RTSP tracker (Orin only)               [phase 3]
+  batch           batch process a video file                  [phase 5]
+  pull            rsync a session from a remote device        [phase 5]
+  recolor         rerun color heuristic on a closed session
+  debug-color     inspect HSV vote on one or more crop JPEGs
+  export-engine   export .pt to .engine via Ultralytics       [phase 3]
+
+Run ``streettracker <command> --help`` for per-command options.
+"""
+
+
+def _print_help() -> None:
+    print(_HELP, end="")
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="streettracker")
-    parser.add_argument(
-        "--version", action="store_true", help="print version and exit"
-    )
-    sub = parser.add_subparsers(dest="cmd", metavar="<command>")
-    sub.add_parser("run", help="live RTSP tracker (Orin only)")
-    sub.add_parser("batch", help="batch process a video file")
-    sub.add_parser("pull", help="rsync a session from a remote device")
-    sub.add_parser("recolor", help="rerun color heuristic on a closed session")
-    sub.add_parser("export-engine", help="export .pt to .engine via Ultralytics")
+    if argv is None:
+        argv = sys.argv[1:]
 
-    args = parser.parse_args(argv)
-    if args.version:
+    if not argv:
+        _print_help()
+        return 0
+
+    head, rest = argv[0], argv[1:]
+
+    if head in ("-h", "--help"):
+        _print_help()
+        return 0
+    if head == "--version":
         from streettracker import __version__
         print(__version__)
         return 0
-    if not args.cmd:
-        parser.print_help()
-        return 0
-    print(f"[streettracker] subcommand '{args.cmd}' not yet implemented", file=sys.stderr)
+
+    if head == "recolor":
+        from streettracker.analysis.recolor import main as recolor_main
+        return recolor_main(rest)
+    if head == "debug-color":
+        from streettracker.analysis.debug_color import main as debug_color_main
+        return debug_color_main(rest)
+
+    if head in ("run", "batch", "pull", "export-engine"):
+        print(
+            f"[streettracker] subcommand '{head}' not yet implemented",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(f"[streettracker] unknown subcommand: {head}", file=sys.stderr)
+    _print_help()
     return 2
 
 
