@@ -1113,9 +1113,15 @@ def run(args):
     # present, supersedes the right_half_only zone gate entirely.
     # Schema:
     #   snap_cfg["snap_gate"] = {
-    #     "polygon_frac":     [[x_frac, y_frac], ...],
-    #     "trigger_t_prime":  [t', ...],
-    #     "t_usable_frac":    [lo, hi]   (optional, defaults to [0, 1])
+    #     "polygon_frac":        [[x_frac, y_frac], ...],
+    #     "trigger_t_prime":     [t', ...],
+    #     "t_usable_frac":       [lo, hi]   (optional, defaults to [0, 1])
+    #     "trigger_directions":  ["forward"|"reverse"|"both", ...]
+    #                            (optional, defaults to all "both";
+    #                            parallel to trigger_t_prime so each
+    #                            trigger can be restricted to one
+    #                            direction of motion -- forward = t'
+    #                            increasing = camera-approach side)
     #   }
     snap_road_gate = None  # type: Optional[RoadGateConfig]
     sg_cfg = snap_cfg.get("snap_gate")
@@ -1124,6 +1130,7 @@ def run(args):
             polygon_frac=sg_cfg["polygon_frac"],
             trigger_t_prime=sg_cfg["trigger_t_prime"],
             t_usable_frac=tuple(sg_cfg.get("t_usable_frac", (0.0, 1.0))),
+            trigger_directions=sg_cfg.get("trigger_directions"),
         )
     snapshotter = None  # type: Optional[ReolinkSnapshotter]
     snap_planner = None  # type: Optional[SnapPlanner]
