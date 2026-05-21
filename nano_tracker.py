@@ -40,6 +40,8 @@ import time
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
+from snap_planner import RoadGateConfig, SnapPlanner, SnapPlannerConfig
+
 # Line-buffer stdout/stderr when redirected to a file (as in `nohup ... > log`).
 # Without this, Python block-buffers ~8 KiB of [main] / per-frame lines and the
 # log appears empty for minutes -- making it look like nothing is happening when
@@ -1099,11 +1101,32 @@ def run(args):
     #   heavy motion blur: ~5-20
     # Start around 50 if enabling; tune from the [snap] track N skip logs.
     snap_min_sharpness = float(snap_cfg.get("min_sharpness", 0.0))
-    snap_growth_factor = float(snap_cfg.get("refire_growth_factor", 1.5))
-    snap_max_per_track = int(snap_cfg.get("max_snaps_per_track", 3))
+    snap_max_per_track = int(snap_cfg.get("max_snaps_per_track", 1))
+    snap_plateau_frames = int(snap_cfg.get("plateau_frames", 20))
+    snap_max_wait_frames = int(snap_cfg.get("max_wait_frames", 90))
+    snap_decay_ratio = float(snap_cfg.get("decay_ratio", 0.82))
+    snap_exit_margin_frac = float(snap_cfg.get("exit_margin_frac", 0.04))
+    snap_cooldown_frames = int(snap_cfg.get("post_fire_cooldown_frames", 30))
     snap_keep_days = int(snap_cfg.get("keep_days", 7))
     snap_cleanup_interval_s = float(snap_cfg.get("cleanup_interval_s", 3600.0))
+    # Optional operator-traced road polygon + axis triggers.  When
+    # present, supersedes the right_half_only zone gate entirely.
+    # Schema:
+    #   snap_cfg["snap_gate"] = {
+    #     "polygon_frac":     [[x_frac, y_frac], ...],
+    #     "trigger_t_prime":  [t', ...],
+    #     "t_usable_frac":    [lo, hi]   (optional, defaults to [0, 1])
+    #   }
+    snap_road_gate = None  # type: Optional[RoadGateConfig]
+    sg_cfg = snap_cfg.get("snap_gate")
+    if sg_cfg:
+        snap_road_gate = RoadGateConfig(
+            polygon_frac=sg_cfg["polygon_frac"],
+            trigger_t_prime=sg_cfg["trigger_t_prime"],
+            t_usable_frac=tuple(sg_cfg.get("t_usable_frac", (0.0, 1.0))),
+        )
     snapshotter = None  # type: Optional[ReolinkSnapshotter]
+    snap_planner = None  # type: Optional[SnapPlanner]
     if snap_enabled:
         cam = cfg["camera"]
         snap_password = args.password or os.environ.get("REOLINK_PASSWORD") or cam.get("password") or ""
@@ -1115,8 +1138,11 @@ def run(args):
             timeout_s=float(snap_cfg.get("timeout_s", 5.0)),
             max_concurrent=int(snap_cfg.get("max_concurrent", 2)),
         )
-        print("[main] Snapshot:    main-stream HTTP @ area_frac>={:.2f}, refire on {:.1f}x growth, max {} per track".format(
-            snap_area_threshold, snap_growth_factor, snap_max_per_track,
+        # Frame size for the planner is fixed in the loop body — we
+        # construct the SnapPlanner lazily there because frame_w / frame_h
+        # aren't known yet at config time.
+        print("[main] Snapshot:    main-stream HTTP @ area_frac>={:.2f}, peak-decay planner, max {} per track + finalize rescue".format(
+            snap_area_threshold, snap_max_per_track,
         ))
         if snap_keep_days > 0:
             print("[main] Snap cleanup: deleting *_main_*.jpg older than {} days (every {:.0f}s)".format(
@@ -1292,6 +1318,21 @@ def run(args):
         """Compute attrs for a finalized track, persist, and update HTML state."""
         nonlocal raw_track_count, last_finalize_time, html_dirty
         raw_track_count += 1
+        # Last-chance snap: if the planner never fired a live snap for
+        # this track (e.g. a brief eligible-window with no decay event),
+        # take one now using whatever the camera currently sees.  The
+        # planner also gates this: tracks that never crossed the area
+        # threshold are skipped (a 4K shot of a distant vehicle isn't
+        # useful).  We then forget the per-track state so the dict
+        # doesn't grow without bound across a long session.
+        if snap_planner is not None and snapshotter is not None:
+            rescue = snap_planner.on_track_finalize(tr.id)
+            if rescue.should_fire:
+                tr.snap_count = rescue.snap_index
+                print("[snap] track {} fire {} reason={} (finalize rescue)".format(
+                    tr.id, rescue.snap_index, rescue.reason))
+                _fire_snapshot(snapshotter, tr, output_dir, rescue.snap_index)
+            snap_planner.forget(tr.id)
         # HQ crop is the per-track best slot updated every detection (area *
         # sharpness, non-edge only), so the peak frame is never lost to the
         # rolling buffer's [::2] halving.  Color voting prefers a non-edge
@@ -1350,6 +1391,10 @@ def run(args):
         nonlocal frame_idx, frames_inferred, frame_h
         nonlocal ir_mode, ir_period_start_wall, last_finalize_time
         nonlocal html_dirty, last_log, last_heartbeat, last_cleanup
+        # SnapPlanner is lazy-initialised on the first frame (we need
+        # frame width/height first), so we have to rebind the enclosing
+        # `snap_planner` from inside this nested function.
+        nonlocal snap_planner
 
         frame_idx += 1
         if frame_h == 0:
@@ -1399,40 +1444,50 @@ def run(args):
             expired = tracker.update(dets, frame_idx, session_t, frame)
             for tr in expired:
                 finalize(tr)
-            # Main-stream snapshot triggers: fire when the bbox crosses
-            # `area_threshold_frac` of frame area, AND re-fire whenever the
-            # area subsequently grows by `refire_growth_factor` (default 1.5x)
-            # vs the area at the last fire.  Capped at `max_snaps_per_track`
-            # fires per track; the N-th fire is saved as
-            # <prefix>_<id>_main_<N>.jpg so post-processing has multiple
-            # chances to recover plate / color / model.  Done after `update()`
-            # so brand-new tracks entering large already get a shot.  Async.
+            # Main-stream snapshot triggers via SnapPlanner.  The planner
+            # treats every frame as a candidate, watches the running peak
+            # quality score (area * sharpness), and fires once at the
+            # peak-decay moment (or earlier on exit-imminent / plateau /
+            # timeout).  A post-fire cooldown keeps the decay tail from
+            # producing redundant near-peak refires.  See snap_planner.py
+            # for the full algorithm and the rationale behind the
+            # parameter defaults.
             if snapshotter is not None:
                 fh_now, fw_now = frame.shape[0], frame.shape[1]
-                frame_area = float(fh_now * fw_now)
-                if frame_area > 0:
+                if snap_planner is None and fh_now > 0 and fw_now > 0:
+                    snap_planner = SnapPlanner(
+                        fw_now, fh_now,
+                        SnapPlannerConfig(
+                            area_threshold_frac=snap_area_threshold,
+                            max_per_track=snap_max_per_track,
+                            min_sharpness=snap_min_sharpness,
+                            decay_ratio=snap_decay_ratio,
+                            plateau_frames=snap_plateau_frames,
+                            max_wait_frames=snap_max_wait_frames,
+                            exit_margin_frac=snap_exit_margin_frac,
+                            post_fire_cooldown_frames=snap_cooldown_frames,
+                            road_gate=snap_road_gate,
+                        ),
+                    )
+                    if snap_road_gate is not None:
+                        rg = snap_planner.road_gate
+                        print("[main] Snapshot:    road-gate mode active "
+                              "({0} polygon vertices, {1} trigger lines, "
+                              "usable t={2:.2f}..{3:.2f})".format(
+                                  len(rg.polygon_px),
+                                  len(rg.triggers_t_prime),
+                                  rg.t_usable_lo, rg.t_usable_hi,
+                              ))
+                if snap_planner is not None:
                     for tr in tracker._active.values():
-                        if not tr.points or tr.snap_count >= snap_max_per_track:
+                        if not tr.points:
                             continue
                         p = tr.points[-1]
-                        bbox_area = (p.x2 - p.x1) * (p.y2 - p.y1)
-                        if bbox_area / frame_area < snap_area_threshold:
-                            continue
-                        # First-fire or re-fire on substantial growth.
-                        if tr.last_snap_area > 0 and bbox_area < tr.last_snap_area * snap_growth_factor:
-                            continue
-                        # Blur gate (opt-in).  Skips the HTTP fire when the bbox
-                        # is too motion-blurred to be readable.  Does NOT consume
-                        # a snap slot or update last_snap_area, so a still-blurry
-                        # track keeps re-checking each frame until either the
-                        # blur clears or the area drops below threshold again.
-                        #
-                        # Sharpness is measured on the *center 60%* of the bbox,
-                        # not the full bbox.  The YOLO box typically includes
-                        # background at the edges (road, foliage, wall corners)
-                        # whose sharp edges prop up the Laplacian variance even
-                        # when the vehicle interior is motion-smeared.  The
-                        # center crop concentrates on vehicle pixels.
+                        # Sharpness is measured on the *center 60%* of the
+                        # bbox -- the YOLO box typically includes background
+                        # at the edges whose sharp edges prop up Laplacian
+                        # variance even when the vehicle interior is smeared.
+                        sharpness = None
                         if snap_min_sharpness > 0.0:
                             bx1 = max(0, int(p.x1)); by1 = max(0, int(p.y1))
                             bx2 = min(fw_now, int(p.x2)); by2 = min(fh_now, int(p.y2))
@@ -1442,22 +1497,27 @@ def run(args):
                                 cx1 = bx1 + mx; cx2 = bx2 - mx
                                 cy1 = by1 + my; cy2 = by2 - my
                                 if cx2 > cx1 and cy2 > cy1:
-                                    sharp = _sharpness_score(frame[cy1:cy2, cx1:cx2])
-                                    if sharp < snap_min_sharpness:
-                                        snapshotter.blur_skipped += 1
-                                        if now - tr.last_blur_skip_logged >= 5.0:
-                                            print("[snap] track {} blur skip (sharp={:.0f} < {:.0f})".format(
-                                                tr.id, sharp, snap_min_sharpness))
-                                            tr.last_blur_skip_logged = now
-                                        continue
-                                    # Log the sharpness of the FIRST passing fire per
-                                    # track for threshold calibration.  No throttle:
-                                    # we want every track represented exactly once.
-                                    if tr.snap_count == 0:
-                                        print("[snap] track {} pass (sharp={:.0f})".format(tr.id, sharp))
-                        tr.snap_count += 1
-                        tr.last_snap_area = bbox_area
-                        _fire_snapshot(snapshotter, tr, output_dir, tr.snap_count)
+                                    sharpness = float(_sharpness_score(frame[cy1:cy2, cx1:cx2]))
+                        decision = snap_planner.consider(
+                            track_id=tr.id,
+                            bbox=(float(p.x1), float(p.y1), float(p.x2), float(p.y2)),
+                            frame_idx=frame_idx,
+                            sharpness=sharpness,
+                        )
+                        if decision.reason == "blur_gate":
+                            snapshotter.blur_skipped += 1
+                            if now - tr.last_blur_skip_logged >= 5.0:
+                                print("[snap] track {} blur skip (sharp={} < {:.0f})".format(
+                                    tr.id, sharpness, snap_min_sharpness))
+                                tr.last_blur_skip_logged = now
+                            continue
+                        if not decision.should_fire:
+                            continue
+                        tr.snap_count = decision.snap_index
+                        tr.last_snap_area = (p.x2 - p.x1) * (p.y2 - p.y1)
+                        print("[snap] track {} fire {} reason={} score={:.3f}".format(
+                            tr.id, decision.snap_index, decision.reason, decision.score))
+                        _fire_snapshot(snapshotter, tr, output_dir, decision.snap_index)
         else:
             dets = []
 
