@@ -123,16 +123,37 @@ class RoadGateConfig(object):
       - ``t_usable_frac``: ``(lo, hi)`` clip range over the raw
         polygon t-range.  Lets us trim a "distant tip" portion of
         the polygon where number plates are at the wrong angle.
+      - ``trigger_directions``: optional parallel list of per-trigger
+        direction filters, one of ``"forward"`` / ``"reverse"`` /
+        ``"both"``.  ``None`` defaults to all-``"both"`` (every
+        trigger fires on either direction of motion).  Forward fires
+        only when ``t'`` is increasing through the trigger (approach
+        side, front-plate visible in our camera setup); reverse fires
+        only when decreasing (departure side, rear-plate visible).
+        Asymmetric triggers let R-to-L and L-to-R tracks each have
+        their own early-capture trigger without one direction's snaps
+        consuming the other direction's budget.
     """
 
-    __slots__ = ("polygon_frac", "trigger_t_prime", "t_usable_frac")
+    __slots__ = ("polygon_frac", "trigger_t_prime", "t_usable_frac",
+                 "trigger_directions")
 
-    def __init__(self, polygon_frac, trigger_t_prime, t_usable_frac=(0.0, 1.0)):
-        # type: (list, list, tuple) -> None
+    def __init__(self, polygon_frac, trigger_t_prime,
+                 t_usable_frac=(0.0, 1.0), trigger_directions=None):
+        # type: (list, list, tuple, Optional[list]) -> None
         self.polygon_frac = [(float(x), float(y)) for x, y in polygon_frac]
         self.trigger_t_prime = [float(t) for t in trigger_t_prime]
         lo, hi = t_usable_frac
         self.t_usable_frac = (float(lo), float(hi))
+        if trigger_directions is None:
+            self.trigger_directions = None  # type: Optional[list]
+        else:
+            self.trigger_directions = [str(d) for d in trigger_directions]
+
+
+# Valid values for per-trigger direction filters.  Kept as a module
+# constant (rather than a typing.Literal) for Python 3.6 compatibility.
+_VALID_DIRECTIONS = ("forward", "reverse", "both")
 
 
 # Trigger reason strings (mirror the Literal in the StreetTracker port).
@@ -331,7 +352,7 @@ class RoadGate(object):
                  "centroid_x", "centroid_y",
                  "t_min_raw", "t_max_raw",
                  "t_usable_lo", "t_usable_hi",
-                 "triggers_t_prime")
+                 "triggers_t_prime", "trigger_directions")
 
     def __init__(self, cfg, frame_w, frame_h):
         # type: (RoadGateConfig, int, int) -> None
@@ -339,6 +360,22 @@ class RoadGate(object):
             raise ValueError("road polygon needs at least 3 vertices")
         if not cfg.trigger_t_prime:
             raise ValueError("road gate has no triggers")
+        if cfg.trigger_directions is None:
+            directions = tuple("both" for _ in cfg.trigger_t_prime)
+        else:
+            if len(cfg.trigger_directions) != len(cfg.trigger_t_prime):
+                raise ValueError(
+                    "trigger_directions length must match trigger_t_prime "
+                    "length ({0} vs {1})".format(
+                        len(cfg.trigger_directions),
+                        len(cfg.trigger_t_prime)))
+            for d in cfg.trigger_directions:
+                if d not in _VALID_DIRECTIONS:
+                    raise ValueError(
+                        "invalid trigger direction {0!r}; expected one "
+                        "of {1}".format(d, _VALID_DIRECTIONS))
+            directions = tuple(cfg.trigger_directions)
+        self.trigger_directions = directions
         # Polygon in pixel coords for the active frame size.
         self.polygon_px = [(fx * frame_w, fy * frame_h) for fx, fy in cfg.polygon_frac]
         # Centroid in pixel coords.
@@ -413,17 +450,30 @@ class RoadGate(object):
     def crossings(self, prev_tp, cur_tp, already_fired):
         # type: (Optional[float], float, set) -> list
         """Trigger indices whose t' lies strictly between prev_tp and
-        cur_tp (in either direction), excluding any already fired.
-        Order: closest-to-prev first."""
+        cur_tp, filtered by each trigger's direction tag and excluding
+        any already fired.  Order: closest-to-prev first.
+
+        A ``"forward"`` trigger fires only when ``cur_tp > prev_tp``;
+        a ``"reverse"`` trigger only when ``cur_tp < prev_tp``;
+        ``"both"`` fires either way.  Stationary frames
+        (``cur_tp == prev_tp``) never fire any trigger -- there is no
+        motion sign to compare against."""
         if prev_tp is None:
             return []
-        if prev_tp <= cur_tp:
+        if cur_tp > prev_tp:
+            motion = "forward"
             lo, hi = prev_tp, cur_tp
-        else:
+        elif cur_tp < prev_tp:
+            motion = "reverse"
             lo, hi = cur_tp, prev_tp
+        else:
+            return []
         hits = []
         for idx, t in enumerate(self.triggers_t_prime):
             if idx in already_fired:
+                continue
+            direction = self.trigger_directions[idx]
+            if direction != "both" and direction != motion:
                 continue
             if lo < t <= hi:
                 hits.append((abs(t - prev_tp), idx))
